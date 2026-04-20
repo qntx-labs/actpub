@@ -21,15 +21,70 @@
 //! The crate is HTTP-framework agnostic: it operates on [`http::Request`]
 //! values and leaves transport to the caller.
 //!
+//! # Example — Cavage signing
+//!
+//! ```
+//! # use actpub_httpsig::{SigningKey, CavageSigner, sha256_digest_header};
+//! # use http::{Request, Method};
+//! let key = SigningKey::generate_ed25519();
+//! let body: Vec<u8> = br#"{"type":"Follow"}"#.to_vec();
+//! let mut req = Request::builder()
+//!     .method(Method::POST)
+//!     .uri("https://example.com/inbox")
+//!     .header("host", "example.com")
+//!     .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
+//!     .header("digest", sha256_digest_header(&body))
+//!     .body(body)
+//!     .unwrap();
+//!
+//! let signer = CavageSigner::new(&key, "https://example.com/users/alice#main-key");
+//! signer.sign(&mut req).unwrap();
+//! assert!(req.headers().contains_key("signature"));
+//! ```
+//!
 //! [cavage]: https://datatracker.ietf.org/doc/html/draft-cavage-http-signatures-12
 //! [rfc9421]: https://www.rfc-editor.org/rfc/rfc9421.html
 //! [aws-lc-rs]: https://docs.rs/aws-lc-rs
 //! [RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(
-    unused_crate_dependencies,
-    dead_code,
-    unused_imports,
-    missing_docs,
-    reason = "crate is a scaffold; dependencies are declared up-front so that implementation work in later phases does not churn the manifest. Remove this allow once the crate has concrete items."
+    clippy::error_impl_error,
+    reason = "`Error` is the idiomatic name for the crate's top-level error enum, matching the `thiserror` convention used pervasively in the Rust ecosystem"
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used,
+        reason = "JSON / byte field indexing via `[\"key\"]` or `[0]` is ergonomic inside tests, and `panic!` / `unwrap()` are the idiomatic way to assert expectations with a failure message when a fixture is wrong"
+    )
+)]
+
+mod cavage;
+mod digest;
+mod error;
+mod key;
+
+use bytes as _;
+use chrono as _;
+use httpdate as _;
+use pkcs8 as _;
+#[cfg(test)]
+use tokio as _;
+use tracing as _;
+use url as _;
+
+pub use self::cavage::{
+    CavageHeaderParams, CavageHeaderSet, CavageSigner, CavageVerified, DEFAULT_HEADER_SET,
+    SIGNATURE_HEADER, cavage_verify,
+};
+pub use self::digest::{SHA256_DIGEST_PREFIX, sha256_digest_header, verify_digest_header};
+pub use self::error::Error;
+pub use self::key::{
+    Algorithm, Ed25519PublicKey, Ed25519SigningKey, Multikey, RsaBits, RsaPublicKey, RsaSigningKey,
+    SigningKey, VerifyingKey,
+};
+
+/// Crate [`Result`] alias with the default error type set to [`Error`].
+pub type Result<T, E = Error> = core::result::Result<T, E>;
