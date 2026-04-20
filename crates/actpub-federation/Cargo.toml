@@ -1,0 +1,43 @@
+[package]
+name = "actpub-federation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Federation framework for ActivityPub: typed fetch, inbox receive, outbox queue."
+categories = ["web-programming"]
+keywords = ["activitypub", "fediverse", "federation", "inbox", "outbox"]
+
+[dependencies]
+actpub-activitystreams = { workspace = true }
+actpub-core = { workspace = true }
+actpub-httpsig = { workspace = true }
+actpub-webfinger = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest-middleware = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+tokio-util = { workspace = true, features = ["time"] }
+futures = { workspace = true }
+itertools = { workspace = true }
+httpdate = { workspace = true }
+moka = { workspace = true, features = ["future"] }
+bon = { workspace = true }
+pin-project-lite = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+wiremock = { workspace = true }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

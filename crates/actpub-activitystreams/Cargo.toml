@@ -1,0 +1,24 @@
+[package]
+name = "actpub-activitystreams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Activity Streams 2.0 data model and vocabulary for ActivityPub."
+categories = ["web-programming", "encoding"]
+keywords = ["activitypub", "activitystreams", "fediverse", "json-ld", "w3c"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+mime = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+insta = { workspace = true, features = ["json"] }
+
+[lints]
+workspace = true

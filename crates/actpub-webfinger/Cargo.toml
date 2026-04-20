@@ -1,0 +1,30 @@
+[package]
+name = "actpub-webfinger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebFinger (RFC 7033) client and server primitives for ActivityPub."
+categories = ["web-programming", "authentication"]
+keywords = ["webfinger", "activitypub", "fediverse", "rfc7033"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+http = { workspace = true }
+mime = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = ["client"]
+client = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+[package]
+name = "actpub-httpsig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dual-stack HTTP Message Signatures (Cavage draft-12 + RFC 9421) with RSA & Ed25519 via aws-lc-rs."
+categories = ["cryptography", "authentication", "web-programming"]
+keywords = ["http-signatures", "activitypub", "rfc9421", "cavage", "fediverse"]
+
+[dependencies]
+http = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+
+aws-lc-rs = { workspace = true }
+pkcs8 = { workspace = true }
+pem = { workspace = true }
+base64ct = { workspace = true }
+multibase = { workspace = true }
+unsigned-varint = { workspace = true }
+
+httpdate = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+pretty_assertions = { workspace = true }
+hex-literal = { workspace = true }
+
+[lints]
+workspace = true

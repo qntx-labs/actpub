@@ -1,0 +1,29 @@
+[package]
+name = "actpub-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core ActivityPub protocol traits, Actor model and key FEP extensions."
+categories = ["web-programming"]
+keywords = ["activitypub", "fediverse", "fep-521a", "fep-8b32", "data-integrity"]
+
+[dependencies]
+actpub-activitystreams = { workspace = true }
+actpub-httpsig = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

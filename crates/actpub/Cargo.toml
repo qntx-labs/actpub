@@ -1,0 +1,28 @@
+[package]
+name = "actpub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ActivityPub protocol SDK for Rust — a production-ready, enterprise-grade Fediverse toolkit."
+categories = ["web-programming"]
+keywords = ["activitypub", "fediverse", "mastodon", "lemmy", "webfinger"]
+readme = "../../README.md"
+
+[dependencies]
+actpub-activitystreams = { workspace = true }
+actpub-webfinger = { workspace = true }
+actpub-nodeinfo = { workspace = true }
+actpub-httpsig = { workspace = true }
+actpub-core = { workspace = true }
+actpub-federation = { workspace = true, optional = true }
+actpub-axum = { workspace = true, optional = true }
+
+[features]
+default = ["federation", "axum", "client"]
+federation = ["dep:actpub-federation"]
+axum = ["dep:actpub-axum", "federation"]
+client = ["actpub-webfinger/client", "actpub-nodeinfo/client"]
+
+[lints]
+workspace = true

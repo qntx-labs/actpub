@@ -1,0 +1,28 @@
+[package]
+name = "actpub-nodeinfo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NodeInfo 2.0/2.1 and FEP-0151 server metadata protocol for ActivityPub."
+categories = ["web-programming"]
+keywords = ["nodeinfo", "activitypub", "fediverse", "fep-0151"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = ["client"]
+client = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true
