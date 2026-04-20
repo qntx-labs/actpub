@@ -99,7 +99,7 @@ impl SignatureInput {
 }
 
 /// Parses the raw `Signature-Input:` header into a sequence of
-/// `(label, [``SignatureInput``])` pairs, preserving insertion order.
+/// (label, [`SignatureInput`]) pairs, preserving insertion order.
 ///
 /// # Errors
 ///

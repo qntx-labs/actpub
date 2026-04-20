@@ -67,6 +67,7 @@ mod digest;
 mod error;
 mod key;
 mod rfc9421;
+mod verify;
 
 use bytes as _;
 use chrono as _;
@@ -95,6 +96,7 @@ pub use self::rfc9421::{
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_dict, parse_signature_input_dict,
     rfc9421_verify, serialise_signature_dict, serialise_signature_input_dict,
 };
+pub use self::verify::{Verified, verify};
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].
 pub type Result<T, E = Error> = core::result::Result<T, E>;
