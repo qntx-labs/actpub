@@ -1,12 +1,14 @@
 //! Cavage draft-12 request verifier.
 
 use base64ct::{Base64, Encoding};
+use chrono::{DateTime, Utc};
 use http::Request;
 
 use crate::cavage::canonical::{Timestamps, build_signature_base};
 use crate::cavage::header::{CavageHeaderParams, SIGNATURE_HEADER};
 use crate::error::Error;
 use crate::key::{Algorithm, VerifyingKey};
+use crate::policy::VerifyPolicy;
 
 /// Successful verification report.
 #[derive(Debug, Clone)]
@@ -39,6 +41,35 @@ pub fn cavage_verify<B, F>(req: &Request<B>, resolve_key: F) -> Result<CavageVer
 where
     F: FnOnce(&str) -> Result<VerifyingKey, Error>,
 {
+    cavage_verify_with_policy(
+        req,
+        &VerifyPolicy::no_freshness_check(),
+        Utc::now(),
+        resolve_key,
+    )
+}
+
+/// Verifies a Cavage-signed request **with replay-protection**.
+///
+/// Equivalent to [`cavage_verify`] except that `policy` is consulted to
+/// reject stale, future-dated or expired timestamps against `now`. Most
+/// production callers should use this form with
+/// [`VerifyPolicy::mastodon`] (or their own tuning) and `Utc::now()`.
+///
+/// # Errors
+///
+/// Same as [`cavage_verify`] plus [`Error::TimestampTooOld`],
+/// [`Error::TimestampInFuture`], [`Error::TimestampExpired`] and
+/// [`Error::TimestampMissing`] when the policy is violated.
+pub fn cavage_verify_with_policy<B, F>(
+    req: &Request<B>,
+    policy: &VerifyPolicy,
+    now: DateTime<Utc>,
+    resolve_key: F,
+) -> Result<CavageVerified, Error>
+where
+    F: FnOnce(&str) -> Result<VerifyingKey, Error>,
+{
     let header = req
         .headers()
         .get(SIGNATURE_HEADER)
@@ -49,6 +80,15 @@ where
     })?;
 
     let params = CavageHeaderParams::parse(raw)?;
+
+    // Freshness check runs *before* the cryptographic verification so
+    // that replayed or expired signatures are rejected without taking a
+    // cryptographic-work timing hit.
+    let date_header = req
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|v| v.to_str().ok());
+    policy.check(params.created, params.expires, date_header, now)?;
 
     let key = resolve_key(&params.key_id).map_err(|e| Error::KeyResolution(e.to_string()))?;
 

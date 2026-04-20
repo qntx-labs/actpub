@@ -66,12 +66,11 @@ mod content_digest;
 mod digest;
 mod error;
 mod key;
+mod policy;
 mod rfc9421;
 mod verify;
 
 use bytes as _;
-use chrono as _;
-use httpdate as _;
 use pkcs8 as _;
 #[cfg(test)]
 use tokio as _;
@@ -80,7 +79,7 @@ use url as _;
 
 pub use self::cavage::{
     CavageHeaderParams, CavageHeaderSet, CavageSigner, CavageVerified, DEFAULT_HEADER_SET,
-    SIGNATURE_HEADER, cavage_verify,
+    SIGNATURE_HEADER, cavage_verify, cavage_verify_with_policy,
 };
 pub use self::content_digest::{
     CONTENT_DIGEST_HEADER, content_digest_header, verify_content_digest_header,
@@ -91,12 +90,14 @@ pub use self::key::{
     Algorithm, Ed25519PublicKey, Ed25519SigningKey, Multikey, RsaBits, RsaPublicKey, RsaSigningKey,
     SigningKey, VerifyingKey,
 };
+pub use self::policy::VerifyPolicy;
 pub use self::rfc9421::{
     Component, DEFAULT_COMPONENTS as RFC9421_DEFAULT_COMPONENTS, Rfc9421Signer, Rfc9421Verified,
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_dict, parse_signature_input_dict,
-    rfc9421_verify, serialise_signature_dict, serialise_signature_input_dict,
+    rfc9421_verify, rfc9421_verify_with_policy, serialise_signature_dict,
+    serialise_signature_input_dict,
 };
-pub use self::verify::{Verified, verify};
+pub use self::verify::{Verified, verify, verify_with_policy};
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].
 pub type Result<T, E = Error> = core::result::Result<T, E>;

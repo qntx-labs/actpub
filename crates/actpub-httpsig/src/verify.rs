@@ -6,12 +6,16 @@
 //! the receiving side, and lets callers verify either kind with one
 //! function call.
 
+use chrono::{DateTime, Utc};
 use http::Request;
 
-use crate::cavage::{CavageVerified, cavage_verify};
+use crate::cavage::{CavageVerified, cavage_verify, cavage_verify_with_policy};
 use crate::error::Error;
 use crate::key::VerifyingKey;
-use crate::rfc9421::{Rfc9421Verified, SIGNATURE_INPUT_HEADER, rfc9421_verify};
+use crate::policy::VerifyPolicy;
+use crate::rfc9421::{
+    Rfc9421Verified, SIGNATURE_INPUT_HEADER, rfc9421_verify, rfc9421_verify_with_policy,
+};
 
 /// Report summarising a successful verification.
 #[derive(Debug, Clone)]
@@ -64,6 +68,32 @@ where
         return rfc9421_verify(req, &mut resolve_key).map(Verified::Rfc9421);
     }
     cavage_verify(req, |kid| resolve_key(kid)).map(Verified::Cavage)
+}
+
+/// Verifies a signed HTTP request **with replay-protection**, picking
+/// the correct flavour automatically.
+///
+/// This is [`verify`]'s policy-aware companion: both `VerifyPolicy` and
+/// a `now` timestamp are threaded through to the underlying verifier.
+///
+/// # Errors
+///
+/// Propagates every error surface of [`cavage_verify_with_policy`] and
+/// [`rfc9421_verify_with_policy`].
+pub fn verify_with_policy<B, F>(
+    req: &Request<B>,
+    policy: &VerifyPolicy,
+    now: DateTime<Utc>,
+    mut resolve_key: F,
+) -> Result<Verified, Error>
+where
+    F: FnMut(&str) -> Result<VerifyingKey, Error>,
+{
+    if req.headers().contains_key(SIGNATURE_INPUT_HEADER) {
+        return rfc9421_verify_with_policy(req, policy, now, &mut resolve_key)
+            .map(Verified::Rfc9421);
+    }
+    cavage_verify_with_policy(req, policy, now, |kid| resolve_key(kid)).map(Verified::Cavage)
 }
 
 #[cfg(test)]

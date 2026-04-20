@@ -37,4 +37,4 @@ pub use self::signature_input::{
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_input_dict,
     serialise_signature_input_dict,
 };
-pub use self::verify::{Rfc9421Verified, rfc9421_verify};
+pub use self::verify::{Rfc9421Verified, rfc9421_verify, rfc9421_verify_with_policy};

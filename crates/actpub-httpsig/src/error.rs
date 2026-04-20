@@ -103,4 +103,38 @@ pub enum Error {
     /// A signature parameter required by the standard is missing.
     #[error("required signature parameter `{0}` is missing")]
     MissingSignatureParameter(&'static str),
+
+    /// The signature carried no `created` parameter and no `Date`
+    /// header, and the active [`VerifyPolicy`](crate::VerifyPolicy)
+    /// requires one.
+    #[error("no `created` parameter or `Date` header on a signature that requires freshness")]
+    TimestampMissing,
+
+    /// The signature is older than the policy's `max_age`.
+    #[error("signature is too old: timestamp {timestamp}, now {now}")]
+    TimestampTooOld {
+        /// The signed timestamp, either from `created` or the `Date` header.
+        timestamp: chrono::DateTime<chrono::Utc>,
+        /// The verifier's current wall-clock time.
+        now: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// The signature claims to have been produced further in the future
+    /// than the policy's `max_clock_skew_future` tolerance allows.
+    #[error("signature claims a future timestamp: timestamp {timestamp}, now {now}")]
+    TimestampInFuture {
+        /// The signed timestamp.
+        timestamp: chrono::DateTime<chrono::Utc>,
+        /// The verifier's current wall-clock time.
+        now: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// The signature's `expires` parameter indicates it has lapsed.
+    #[error("signature expired at {expires}, now {now}")]
+    TimestampExpired {
+        /// The `expires` parameter interpreted as a UTC timestamp.
+        expires: chrono::DateTime<chrono::Utc>,
+        /// The verifier's current wall-clock time.
+        now: chrono::DateTime<chrono::Utc>,
+    },
 }

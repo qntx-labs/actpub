@@ -1,9 +1,11 @@
 //! RFC 9421 request verifier.
 
+use chrono::{DateTime, Utc};
 use http::Request;
 
 use crate::error::Error;
 use crate::key::{Algorithm, VerifyingKey};
+use crate::policy::VerifyPolicy;
 use crate::rfc9421::components::build_signature_base;
 use crate::rfc9421::signature::{SIGNATURE_HEADER, parse_signature_dict};
 use crate::rfc9421::signature_input::{
@@ -35,10 +37,43 @@ pub struct Rfc9421Verified {
 /// [`Error::VerificationFailed`] if no label produces a valid signature.
 /// See also [`Error::MalformedSignatureHeader`] and
 /// [`Error::KeyResolution`].
-pub fn rfc9421_verify<B, F>(req: &Request<B>, mut resolve_key: F) -> Result<Rfc9421Verified, Error>
+pub fn rfc9421_verify<B, F>(req: &Request<B>, resolve_key: F) -> Result<Rfc9421Verified, Error>
 where
     F: FnMut(&str) -> Result<VerifyingKey, Error>,
 {
+    rfc9421_verify_with_policy(
+        req,
+        &VerifyPolicy::no_freshness_check(),
+        Utc::now(),
+        resolve_key,
+    )
+}
+
+/// Verifies an RFC 9421-signed request **with replay-protection**.
+///
+/// Equivalent to [`rfc9421_verify`] except that `policy` is consulted
+/// for every candidate label to reject stale, future-dated or expired
+/// timestamps against `now`.
+///
+/// # Errors
+///
+/// Same as [`rfc9421_verify`] plus [`Error::TimestampTooOld`],
+/// [`Error::TimestampInFuture`], [`Error::TimestampExpired`] and
+/// [`Error::TimestampMissing`] when the policy is violated.
+pub fn rfc9421_verify_with_policy<B, F>(
+    req: &Request<B>,
+    policy: &VerifyPolicy,
+    now: DateTime<Utc>,
+    mut resolve_key: F,
+) -> Result<Rfc9421Verified, Error>
+where
+    F: FnMut(&str) -> Result<VerifyingKey, Error>,
+{
+    let date_header = req
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let input_raw = req
         .headers()
         .get(SIGNATURE_INPUT_HEADER)
@@ -75,6 +110,13 @@ where
             )));
             continue;
         };
+
+        // Freshness check on a per-label basis so that one rotated
+        // label does not invalidate a sibling signature.
+        if let Err(e) = policy.check(input.created, input.expires, date_header.as_deref(), now) {
+            last_err = Some(e);
+            continue;
+        }
 
         let Some(key_id) = input.keyid.as_deref() else {
             last_err = Some(Error::MissingSignatureParameter("keyid"));

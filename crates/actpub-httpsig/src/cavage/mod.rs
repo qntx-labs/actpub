@@ -16,4 +16,4 @@ mod verify;
 pub use self::canonical::CavageHeaderSet;
 pub use self::header::{CavageHeaderParams, SIGNATURE_HEADER};
 pub use self::sign::{CavageSigner, DEFAULT_HEADER_SET};
-pub use self::verify::{CavageVerified, cavage_verify};
+pub use self::verify::{CavageVerified, cavage_verify, cavage_verify_with_policy};
