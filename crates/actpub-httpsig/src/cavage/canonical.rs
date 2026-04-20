@@ -12,6 +12,7 @@
 use http::Request;
 
 use crate::error::Error;
+use crate::http_shared::collect_canonical_header_value;
 
 /// The `(request-target)` pseudo-header.
 pub(crate) const REQUEST_TARGET: &str = "(request-target)";
@@ -166,32 +167,12 @@ fn write_line<B>(
         }
         other => {
             let lowered = other.to_ascii_lowercase();
-            let value = collect_header(req, &lowered)
+            let value = collect_canonical_header_value(req, &lowered)
                 .ok_or_else(|| Error::RequiredHeaderAbsent(lowered.clone()))?;
             write!(out, "{lowered}: {value}").expect(infallible);
         }
     }
     Ok(())
-}
-
-/// Per Cavage §2.3 the canonical value of a repeated header is the
-/// comma-separated concatenation of its values, in appearance order.
-fn collect_header<B>(req: &Request<B>, lower_name: &str) -> Option<String> {
-    let matches = req
-        .headers()
-        .iter()
-        .filter(|(name, _)| name.as_str() == lower_name)
-        .map(|(_, value)| value.to_str().unwrap_or("").trim());
-    let mut joined = String::new();
-    let mut seen = false;
-    for value in matches {
-        if seen {
-            joined.push_str(", ");
-        }
-        seen = true;
-        joined.push_str(value);
-    }
-    seen.then_some(joined)
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@
 use http::Request;
 
 use crate::error::Error;
+use crate::http_shared::collect_canonical_header_value;
 
 /// A single component in an RFC 9421 signature base.
 ///
@@ -168,25 +169,8 @@ fn request_target<B>(req: &Request<B>) -> String {
 }
 
 fn header_value<B>(req: &Request<B>, lower_name: &str) -> Result<String, Error> {
-    let matches = req
-        .headers()
-        .iter()
-        .filter(|(n, _)| n.as_str() == lower_name)
-        .map(|(_, v)| v.to_str().unwrap_or("").trim());
-    let mut joined = String::new();
-    let mut seen = false;
-    for v in matches {
-        if seen {
-            joined.push_str(", ");
-        }
-        seen = true;
-        joined.push_str(v);
-    }
-    if seen {
-        Ok(joined)
-    } else {
-        Err(Error::RequiredHeaderAbsent(lower_name.to_owned()))
-    }
+    collect_canonical_header_value(req, lower_name)
+        .ok_or_else(|| Error::RequiredHeaderAbsent(lower_name.to_owned()))
 }
 
 /// Builds the RFC 9421 signature base for `req` using the given

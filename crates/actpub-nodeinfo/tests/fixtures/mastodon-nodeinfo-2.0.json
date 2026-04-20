@@ -1,0 +1,26 @@
+{
+  "version": "2.0",
+  "software": {
+    "name": "mastodon",
+    "version": "4.5.0"
+  },
+  "protocols": ["activitypub"],
+  "services": {
+    "outbound": [],
+    "inbound": []
+  },
+  "usage": {
+    "users": {
+      "total": 1000000,
+      "activeMonth": 250000,
+      "activeHalfyear": 500000
+    },
+    "localPosts": 5000000
+  },
+  "openRegistrations": false,
+  "metadata": {
+    "nodeName": "Mastodon Social",
+    "nodeDescription": "The original Mastodon instance.",
+    "languages": ["en"]
+  }
+}

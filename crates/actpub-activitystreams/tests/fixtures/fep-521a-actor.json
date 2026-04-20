@@ -1,0 +1,22 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://www.w3.org/ns/cid/v1"
+  ],
+  "id": "https://example.com/users/alice",
+  "type": "Person",
+  "preferredUsername": "alice",
+  "inbox": "https://example.com/users/alice/inbox",
+  "outbox": "https://example.com/users/alice/outbox",
+  "assertionMethod": [
+    {
+      "id": "https://example.com/users/alice#ed25519-key",
+      "type": "Multikey",
+      "controller": "https://example.com/users/alice",
+      "publicKeyMultibase": "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+    }
+  ],
+  "authentication": [
+    "https://example.com/users/alice#ed25519-key"
+  ]
+}

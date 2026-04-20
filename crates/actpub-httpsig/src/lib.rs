@@ -65,6 +65,7 @@ mod cavage;
 mod content_digest;
 mod digest;
 mod error;
+mod http_shared;
 mod key;
 mod policy;
 mod rfc9421;
@@ -82,7 +83,8 @@ pub use self::cavage::{
     SIGNATURE_HEADER, cavage_verify, cavage_verify_with_policy,
 };
 pub use self::content_digest::{
-    CONTENT_DIGEST_HEADER, content_digest_header, verify_content_digest_header,
+    CONTENT_DIGEST_HEADER, DigestAlgorithm, content_digest_header, content_digest_header_with,
+    verify_any_content_digest_header, verify_content_digest_header,
 };
 pub use self::digest::{SHA256_DIGEST_PREFIX, sha256_digest_header, verify_digest_header};
 pub use self::error::Error;

@@ -1,0 +1,27 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/data-integrity/v2"
+  ],
+  "id": "https://example.com/activities/01HQ4N7G",
+  "type": "Create",
+  "actor": "https://example.com/users/alice",
+  "to": [
+    "https://www.w3.org/ns/activitystreams#Public"
+  ],
+  "object": {
+    "id": "https://example.com/notes/01HQ4N7H",
+    "type": "Note",
+    "attributedTo": "https://example.com/users/alice",
+    "content": "<p>Hello, signed Fediverse</p>",
+    "published": "2026-04-20T10:00:00Z"
+  },
+  "proof": {
+    "type": "DataIntegrityProof",
+    "cryptosuite": "eddsa-jcs-2022",
+    "created": "2026-04-20T10:00:00Z",
+    "verificationMethod": "https://example.com/users/alice#ed25519-key",
+    "proofPurpose": "assertionMethod",
+    "proofValue": "z3F4nT9mC8rE7QXJyV9hP2wKzN8sA5bL5Wx2nVcBpQs6tHvLa9rFmGu4kMmJaWjZxDcN8eSyT5oP7iA"
+  }
+}

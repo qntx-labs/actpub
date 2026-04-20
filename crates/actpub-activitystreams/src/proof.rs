@@ -38,6 +38,10 @@ use url::Url;
 /// specialised use cases (challenge–response auth, proof chaining).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the `proof_purpose`, `proof_value` and `previous_proof` field names are mandated verbatim by the W3C Data Integrity / FEP-8b32 vocabulary and cannot be renamed without breaking interoperability"
+)]
 pub struct Proof {
     /// Discriminator for the proof scheme. MUST be
     /// [`Proof::DATA_INTEGRITY_PROOF`] when the proof is a Data
