@@ -7,11 +7,36 @@
 //! without any full JSON-LD processing.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::value::OneOrMany;
+
+/// Parses a compile-time constant URI string. The panic is unreachable at
+/// runtime because every call site passes a static string literal that was
+/// already validated against the url crate's grammar; failure would
+/// indicate a bug in a new crate constant, caught by the unit-test suite.
+#[allow(
+    clippy::panic,
+    reason = "panic on failure is unreachable: every caller passes a compile-time-constant URI that is covered by unit tests"
+)]
+fn parse_static_uri(label: &'static str, uri: &'static str) -> Url {
+    Url::parse(uri).unwrap_or_else(|e| panic!("invalid {label} URI constant `{uri}`: {e}"))
+}
+
+/// Lazily-parsed [`Context::AS2`] URL, shared across all constructors to
+/// avoid per-call allocation.
+static AS2_URL: LazyLock<Url> = LazyLock::new(|| parse_static_uri("AS2", Context::AS2));
+
+/// Lazily-parsed [`Context::SECURITY_V1`] URL.
+static SECURITY_V1_URL: LazyLock<Url> =
+    LazyLock::new(|| parse_static_uri("security/v1", Context::SECURITY_V1));
+
+/// Lazily-parsed [`Context::DATA_INTEGRITY_V2`] URL.
+static DATA_INTEGRITY_V2_URL: LazyLock<Url> =
+    LazyLock::new(|| parse_static_uri("data-integrity/v2", Context::DATA_INTEGRITY_V2));
 
 /// A single entry in the `@context` array.
 ///
@@ -55,15 +80,9 @@ impl Context {
     pub const SECURITY_V1: &'static str = "https://w3id.org/security/v1";
 
     /// Creates a [`Context`] containing only the canonical AS 2.0 URI.
-    ///
-    /// # Panics
-    ///
-    /// Never panics; [`Self::AS2`] is a compile-time valid URL.
     #[must_use]
     pub fn activitystreams() -> Self {
-        Self(OneOrMany::one(ContextEntry::Uri(
-            Url::parse(Self::AS2).expect("AS2 URI is valid"),
-        )))
+        Self(OneOrMany::one(ContextEntry::Uri(AS2_URL.clone())))
     }
 
     /// Creates a [`Context`] containing the AS 2.0 URI plus the Security v1
@@ -71,8 +90,8 @@ impl Context {
     #[must_use]
     pub fn activitystreams_security() -> Self {
         Self(OneOrMany::many(vec![
-            ContextEntry::Uri(Url::parse(Self::AS2).expect("AS2 URI is valid")),
-            ContextEntry::Uri(Url::parse(Self::SECURITY_V1).expect("security/v1 URI is valid")),
+            ContextEntry::Uri(AS2_URL.clone()),
+            ContextEntry::Uri(SECURITY_V1_URL.clone()),
         ]))
     }
 
@@ -81,10 +100,8 @@ impl Context {
     #[must_use]
     pub fn activitystreams_integrity() -> Self {
         Self(OneOrMany::many(vec![
-            ContextEntry::Uri(Url::parse(Self::AS2).expect("AS2 URI is valid")),
-            ContextEntry::Uri(
-                Url::parse(Self::DATA_INTEGRITY_V2).expect("data-integrity/v2 URI is valid"),
-            ),
+            ContextEntry::Uri(AS2_URL.clone()),
+            ContextEntry::Uri(DATA_INTEGRITY_V2_URL.clone()),
         ]))
     }
 
@@ -156,7 +173,7 @@ impl<T> WithContext<T> {
     }
 
     /// Wraps `inner` with an explicit context.
-    pub const fn with_context(context: Context, inner: T) -> Self {
+    pub const fn with_ctx(context: Context, inner: T) -> Self {
         Self { context, inner }
     }
 

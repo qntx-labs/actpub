@@ -115,11 +115,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_function_is_callable() {
-        // Compile-time check: signature is `async fn(&Account, &Client) -> Result<Jrd, Error>`.
-        fn _assert_send<F: Send>(_: F) {}
+    fn resolve_future_is_send() {
+        // Compile-time check: the returned future is `Send`, which is
+        // required for the client to be usable in multi-threaded async
+        // runtimes such as Tokio's default scheduler.
+        fn assert_send<F: Send>(_: F) {}
         let client = Client::new();
         let account = Account::parse("acct:a@b.example").unwrap();
-        _assert_send(resolve(&account, &client));
+        assert_send(resolve(&account, &client));
     }
 }

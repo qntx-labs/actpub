@@ -138,6 +138,8 @@ dependencies = [
 name = "actpub-webfinger"
 version = "0.1.0"
 dependencies = [
+ "idna",
+ "percent-encoding",
  "pretty_assertions",
  "reqwest",
  "serde",

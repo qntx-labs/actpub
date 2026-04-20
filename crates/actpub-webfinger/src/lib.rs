@@ -43,6 +43,17 @@
 //!
 //! [endpoint]: https://datatracker.ietf.org/doc/html/rfc7033#section-4
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(
+    clippy::error_impl_error,
+    reason = "`Error` is the idiomatic name for the crate's top-level error enum, matching the `thiserror` convention used pervasively in the Rust ecosystem"
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        reason = "JSON field indexing via `Value[\"key\"]` is ergonomic inside tests and its panic-on-missing behaviour is the desired failure mode when fixtures are wrong"
+    )
+)]
 
 mod account;
 #[cfg(feature = "client")]

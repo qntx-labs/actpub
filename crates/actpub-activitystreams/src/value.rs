@@ -129,6 +129,15 @@ impl<'a, T> IntoIterator for &'a OneOrMany<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a mut OneOrMany<T> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
 impl<T> From<T> for OneOrMany<T> {
     fn from(value: T) -> Self {
         Self::one(value)

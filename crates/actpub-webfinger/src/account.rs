@@ -3,10 +3,31 @@
 use std::fmt;
 use std::str::FromStr;
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::Error;
+
+/// Characters that must be percent-encoded inside the `resource=` query
+/// parameter value. This follows RFC 3986 `query` component rules but keeps
+/// the `:` and `@` intact since they appear in every `acct:user@host` URI
+/// and Fediverse servers universally expect them unencoded.
+const RESOURCE_QUERY: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'#')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'&')
+    .add(b'=')
+    .add(b'+')
+    .add(b'%');
 
 /// A Fediverse account identifier of the form `acct:user@host`.
 ///
@@ -35,18 +56,35 @@ pub struct Account {
 impl Account {
     /// Constructs an [`Account`] from its components.
     ///
-    /// Both must be non-empty. The host is normalised to lowercase.
+    /// Both must be non-empty. The host is normalised using IDNA 2008
+    /// (Unicode → ASCII Punycode, lowercased) per
+    /// [RFC 7565 §7][rfc7565-7], so internationalised domain names are
+    /// accepted and stored in their canonical Punycode form.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidAcct`] if `user` or `host` is empty.
+    /// Returns [`Error::InvalidAcct`] if `user` or `host` is empty, or if
+    /// `host` contains characters that IDNA cannot map to a valid DNS
+    /// label.
+    ///
+    /// [rfc7565-7]: https://www.rfc-editor.org/rfc/rfc7565#section-7
     pub fn new(user: impl Into<String>, host: impl Into<String>) -> Result<Self, Error> {
         let user = user.into();
-        let host = host.into().to_lowercase();
-        if user.is_empty() || host.is_empty() {
+        let host_raw = host.into();
+        if user.is_empty() || host_raw.is_empty() {
             return Err(Error::InvalidAcct("empty user or host".into()));
         }
-        Ok(Self { user, host })
+        let host_ascii = idna::domain_to_ascii(&host_raw)
+            .map_err(|e| Error::InvalidAcct(format!("invalid IDN host `{host_raw}`: {e}")))?;
+        if host_ascii.is_empty() {
+            return Err(Error::InvalidAcct(format!(
+                "host `{host_raw}` maps to an empty IDNA label"
+            )));
+        }
+        Ok(Self {
+            user,
+            host: host_ascii,
+        })
     }
 
     /// Parses a string into an [`Account`].
@@ -161,21 +199,13 @@ impl From<Account> for String {
     }
 }
 
-/// Minimal percent-encoder for the `resource=` query-string value.
+/// Percent-encodes the `resource=` query-string value.
 ///
-/// Only encodes characters that would otherwise be interpreted by the URL
-/// parser; notably `:` and `@` inside the `acct:` URI are left intact.
+/// Uses the RFC 3986 `query` component set but leaves `:` and `@` intact,
+/// since these appear in every `acct:user@host` URI and Fediverse servers
+/// universally accept (and in practice require) them unencoded.
 fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':' | b'@' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    utf8_percent_encode(input, RESOURCE_QUERY).to_string()
 }
 
 #[cfg(test)]
@@ -209,6 +239,19 @@ mod tests {
         assert_eq!(a.host(), "example.com");
         // But preserves user case per RFC 7565 §7.
         assert_eq!(a.user(), "Alice");
+    }
+
+    #[test]
+    fn idna_normalises_unicode_host_to_punycode() {
+        // Unicode domain label should be converted to ASCII Punycode.
+        let a = Account::parse("acct:alice@例え.jp").unwrap();
+        assert_eq!(a.host(), "xn--r8jz45g.jp");
+    }
+
+    #[test]
+    fn idna_rejects_invalid_unicode_labels() {
+        // Contains a label that is not valid per IDNA.
+        assert!(Account::new("alice", "\u{FDD0}.jp").is_err());
     }
 
     #[test]

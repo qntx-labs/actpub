@@ -50,6 +50,10 @@ pub type LanguageMap = BTreeMap<String, String>;
 /// [page]: https://www.w3.org/TR/activitystreams-core/#dfn-collectionpage
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the `object`, `relationship`, `subject` etc. field names are all mandated verbatim by the Activity Streams 2.0 vocabulary and cannot be renamed without breaking interoperability"
+)]
 pub struct Object {
     /// Globally unique identifier of this object.
     #[serde(skip_serializing_if = "Option::is_none")]

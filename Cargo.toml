@@ -24,6 +24,8 @@ serde = { version = "1.0.228", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 serde_jcs = "0.2.0"
 url = { version = "2.5.8", default-features = false, features = ["std"] }
+idna = { version = "1.1.0", default-features = false, features = ["std", "compiled_data"] }
+percent-encoding = { version = "2.3.2", default-features = false, features = ["std"] }
 chrono = { version = "0.4.44", default-features = false, features = ["std", "clock", "serde"] }
 mime = "0.3.17"
 thiserror = "2.0.18"
