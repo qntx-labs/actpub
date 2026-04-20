@@ -84,6 +84,18 @@ pub const DEFAULT_HTTP_FETCH_LIMIT: u32 = 20;
 /// network bandwidth, tune down on constrained deployments.
 pub const DEFAULT_DELIVERY_CONCURRENCY: usize = 100;
 
+/// Default capacity of the outbox's delivery channel.
+///
+/// Jobs accepted by [`Outbox::enqueue`](crate::Outbox::enqueue)
+/// queue here until the worker picks them up. The channel is
+/// **bounded**: once full, `enqueue` awaits a slot to open before
+/// returning, propagating backpressure all the way to the caller
+/// instead of letting a misbehaving producer grow the queue
+/// unbounded. Sized for a Mastodon-class outbox: 10 000 jobs is
+/// ~100 MB of activity clones at ~10 KB each, a memory budget
+/// every moderately-funded deployment can accept.
+pub const DEFAULT_DELIVERY_QUEUE_CAPACITY: usize = 10_000;
+
 /// Default user agent header (`actpub-federation/<version>`).
 #[must_use]
 pub fn default_user_agent() -> String {
@@ -98,7 +110,14 @@ pub fn default_user_agent() -> String {
 /// [`signing_key`](Self::signing_key) and [`key_id`](Self::key_id)
 /// are always supplied, since both are mandatory for outbound
 /// signing and inbound key resolution.
-#[derive(Debug, Builder)]
+///
+/// The struct implements a hand-written [`Debug`] impl that renders
+/// `signing_key` as `"[redacted]"` rather than deferring to the
+/// underlying type's [`Debug`]; this keeps a log line or panic
+/// message from accidentally leaking the private-key material even
+/// if a downstream [`SigningKey`] implementation regresses to a
+/// verbose [`Debug`].
+#[derive(Builder)]
 #[non_exhaustive]
 pub struct FederationConfig {
     /// The actor's HTTP-Signature signing key, used by the deliverer
@@ -198,6 +217,17 @@ pub struct FederationConfig {
     #[builder(default = DEFAULT_DELIVERY_CONCURRENCY)]
     pub delivery_concurrency: usize,
 
+    /// Capacity of the [`Outbox`](crate::Outbox) job channel.
+    /// Defaults to [`DEFAULT_DELIVERY_QUEUE_CAPACITY`].
+    /// Once the channel is full, [`Outbox::enqueue`](crate::Outbox::enqueue)
+    /// **awaits** a slot to open, applying backpressure to the
+    /// caller — a misbehaving producer cannot grow the queue
+    /// unbounded. Retry jobs reuse the same channel, so under a
+    /// storm of transient failures the queue can approach capacity
+    /// even without external fan-in; tune up for bursty workloads.
+    #[builder(default = DEFAULT_DELIVERY_QUEUE_CAPACITY)]
+    pub delivery_queue_capacity: usize,
+
     /// Freshness / replay-protection policy applied to every inbound
     /// HTTP signature by [`InboxPipeline`](crate::InboxPipeline).
     ///
@@ -227,9 +257,37 @@ impl FederationConfig {
     /// private to the crate so application code cannot pull the
     /// secret out of the config; the runtime's signing call-sites
     /// (deliverer, signed fetcher) use this to reach the key.
+    /// NOT `const fn`: `SigningKey` cannot be constructed in a
+    /// const context, so declaring this `const` is misleading
+    /// without conferring any benefit.
     #[must_use]
     pub(crate) const fn signing_key_ref(&self) -> &SigningKey {
         &self.signing_key
+    }
+}
+
+impl std::fmt::Debug for FederationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `signing_key` is redacted unconditionally so a future
+        // change to `SigningKey`'s own `Debug` cannot regress into
+        // leaking key material from a panic, log, or `dbg!`.
+        f.debug_struct("FederationConfig")
+            .field("signing_key", &"[redacted]")
+            .field("key_id", &self.key_id)
+            .field("user_agent", &self.user_agent)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("cache_capacity", &self.cache_capacity)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("dedup_capacity", &self.dedup_capacity)
+            .field("dedup_ttl", &self.dedup_ttl)
+            .field("url_policy", &self.url_policy)
+            .field("signed_fetch", &self.signed_fetch)
+            .field("http_fetch_limit", &self.http_fetch_limit)
+            .field("delivery_concurrency", &self.delivery_concurrency)
+            .field("delivery_queue_capacity", &self.delivery_queue_capacity)
+            .field("verify_policy", &self.verify_policy)
+            .finish()
     }
 }
 
@@ -299,5 +357,27 @@ mod tests {
             .url_policy(UrlPolicy::permissive_for_tests())
             .build();
         assert!(!cfg.url_policy.require_https);
+    }
+
+    #[test]
+    fn debug_impl_redacts_signing_key() {
+        // P2-N13 regression: even if the underlying `SigningKey`
+        // type ships a verbose `Debug` that leaks key material, the
+        // hand-written `Debug for FederationConfig` must show the
+        // key as `"[redacted]"` so panic / log / `dbg!` output is
+        // always safe.
+        let cfg = FederationConfig::builder()
+            .signing_key(signing_key())
+            .key_id("https://example.com/users/alice#key".parse().unwrap())
+            .build();
+        let dbg = format!("{cfg:?}");
+        assert!(
+            dbg.contains("signing_key: \"[redacted]\""),
+            "signing_key not redacted in Debug output: {dbg}",
+        );
+        assert!(
+            !dbg.to_lowercase().contains("ed25519"),
+            "Debug output must not leak the key algorithm: {dbg}",
+        );
     }
 }

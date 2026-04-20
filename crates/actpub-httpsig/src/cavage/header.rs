@@ -54,13 +54,39 @@ impl CavageHeaderParams {
                 Error::MalformedSignatureHeader(format!("missing `=` in `{pair}`"))
             })?;
             let value = unquote(value)?;
+            // Draft §2.1 says "all parameters SHALL appear at most
+            // once". Silently overwriting a repeated `keyId` (or any
+            // other parameter) is a **parameter-pollution** bug: a
+            // peer — or an attacker on the path with trivial header
+            // injection — can append a second `keyId` that wins the
+            // `=` assignment and reroutes the verifier to a key they
+            // control. Fail the parse whenever any parameter we
+            // actually consume appears more than once.
             match name {
-                "keyId" | "keyid" => key_id = Some(value.into_owned()),
-                "algorithm" => algorithm = Some(value.into_owned()),
-                "headers" => headers_field = Some(value.into_owned()),
-                "signature" => signature = Some(value.into_owned()),
-                "created" => created = Some(parse_i64_param("created", &value)?),
-                "expires" => expires = Some(parse_i64_param("expires", &value)?),
+                "keyId" | "keyid" => {
+                    reject_if_set(key_id.as_ref(), "keyId")?;
+                    key_id = Some(value.into_owned());
+                }
+                "algorithm" => {
+                    reject_if_set(algorithm.as_ref(), "algorithm")?;
+                    algorithm = Some(value.into_owned());
+                }
+                "headers" => {
+                    reject_if_set(headers_field.as_ref(), "headers")?;
+                    headers_field = Some(value.into_owned());
+                }
+                "signature" => {
+                    reject_if_set(signature.as_ref(), "signature")?;
+                    signature = Some(value.into_owned());
+                }
+                "created" => {
+                    reject_if_set(created.as_ref(), "created")?;
+                    created = Some(parse_i64_param("created", &value)?);
+                }
+                "expires" => {
+                    reject_if_set(expires.as_ref(), "expires")?;
+                    expires = Some(parse_i64_param("expires", &value)?);
+                }
                 _ => {
                     // Unknown parameters are ignored per draft §2.1.
                 }
@@ -179,6 +205,18 @@ fn split_top_level_commas(raw: &str) -> impl Iterator<Item = &str> {
 
 fn split_once_trim(s: &str, c: char) -> Option<(&str, &str)> {
     s.split_once(c).map(|(a, b)| (a.trim(), b.trim()))
+}
+
+/// Returns `Err` if `slot` is already `Some`, signalling a repeated
+/// parameter. Extracted so the at-most-once check stays a single
+/// flat branch per match arm instead of a deeply-nested `if`.
+fn reject_if_set<T>(slot: Option<&T>, name: &'static str) -> Result<(), Error> {
+    if slot.is_some() {
+        return Err(Error::MalformedSignatureHeader(format!(
+            "duplicate `{name}` parameter"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_i64_param(name: &'static str, value: &str) -> Result<i64, Error> {
@@ -341,6 +379,52 @@ mod tests {
         // character the `\` was meant to escape.
         let raw = r#"keyId="abc\""#;
         let err = CavageHeaderParams::parse(raw).expect_err("malformed escape must fail");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
+    }
+
+    #[test]
+    fn malformed_escape_reports_error() {
+        // A quoted value whose contents end in an unpaired backslash
+        // is an encoding error: the parser has no way to know which
+        // character the `\` was meant to escape.
+        let raw = r#"keyId="abc\""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("malformed escape must fail");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
+    }
+
+    #[test]
+    fn duplicate_key_id_is_rejected() {
+        // P2-N15 regression: accepting a repeated `keyId` and taking
+        // the last value would let an attacker append a second
+        // parameter that reroutes the verifier to their own key.
+        // The draft mandates at-most-once, and we now enforce it.
+        let raw = r#"keyId="https://victim.example/#k",keyId="https://attacker.example/#k",headers="host",signature="Zm9v""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("duplicate keyId must be rejected");
+        assert!(
+            matches!(err, Error::MalformedSignatureHeader(ref s) if s.contains("keyId")),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[test]
+    fn duplicate_signature_is_rejected() {
+        let raw = r#"keyId="k",headers="host",signature="Zm9v",signature="YmFy""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("duplicate signature must be rejected");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
+    }
+
+    #[test]
+    fn duplicate_algorithm_is_rejected() {
+        let raw = r#"keyId="k",algorithm="rsa-sha256",algorithm="hs2019",headers="host",signature="Zm9v""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("duplicate algorithm must be rejected");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
+    }
+
+    #[test]
+    fn duplicate_created_is_rejected() {
+        let raw =
+            r#"keyId="k",created=1700000000,created=1700000001,headers="host",signature="Zm9v""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("duplicate created must be rejected");
         assert!(matches!(err, Error::MalformedSignatureHeader(_)));
     }
 }

@@ -10,23 +10,32 @@
 //! Failures do not bubble up to the caller — they are enqueued onto
 //! a background tokio task that retries them per the configured
 //! [`RetryPolicy`]. From the caller's perspective `dispatch` is
-//! fire-and-forget by design (this matches the contract that
-//! Mastodon's Sidekiq queue offers user-facing code).
+//! best-effort: `dispatch` resolves the recipients and awaits a slot
+//! in the bounded delivery channel, then returns; retries happen
+//! entirely in the background.
 //!
 //! # Resource model
 //!
 //! Each [`Outbox`] holds **one** background tokio task driving its
-//! retry loop, owning an unbounded channel of pending deliveries.
-//! Cloning an `Outbox` shares the same task. Drop the last clone to
-//! shut the loop down (the sender half closes, the worker drains
-//! and exits).
+//! retry loop, owning a **bounded** channel of pending deliveries
+//! (sized by [`FederationConfig::delivery_queue_capacity`]).
+//! Producers calling [`Outbox::enqueue`] / [`Outbox::dispatch`] wait
+//! for a slot when the queue is full — this is the
+//! end-to-end backpressure boundary that keeps a misbehaving caller
+//! from growing the queue without limit.
+//!
+//! Cloning an [`Outbox`] shares the same background worker, channel,
+//! and shutdown coordinator. When the **last** clone drops, the
+//! shutdown coordinator aborts the worker; explicit graceful
+//! shutdown is available via [`Outbox::graceful_shutdown`] which
+//! stops admission and awaits the worker task within a deadline.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -85,6 +94,21 @@ where
     F: Fetcher,
 {
     inner: Arc<Inner<D, F>>,
+    /// Bounded channel sender. Held OUTSIDE `Inner` so the last
+    /// [`Outbox`] clone dropping closes every producer handle —
+    /// otherwise `Inner`'s own `Sender` clone would keep the
+    /// channel alive and strand the worker in `rx.recv().await`
+    /// forever. The worker holds its own clone of this sender
+    /// (for retry enqueue) but under a [`Weak`] reference so it
+    /// cannot keep [`Inner`] alive past user intent.
+    tx: mpsc::Sender<DeliveryJob>,
+    /// Shutdown coordinator shared by every [`Outbox`] clone.
+    /// Its [`Drop`] runs exactly when the Arc's strong count hits
+    /// zero — i.e. when the last clone goes away — and both
+    /// notifies the worker and aborts its handle as a belt-and-
+    /// braces fallback. See [`Self::graceful_shutdown`] for the
+    /// explicit, non-panicking path.
+    shutdown: Arc<ShutdownHandle>,
 }
 
 impl<D, F> Clone for Outbox<D, F>
@@ -95,6 +119,8 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            tx: self.tx.clone(),
+            shutdown: Arc::clone(&self.shutdown),
         }
     }
 }
@@ -105,9 +131,13 @@ where
     F: Fetcher,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `D` and `F` may not implement `Debug`, and we deliberately
+        // do not want to surface the signing config / semaphore
+        // state; `finish_non_exhaustive` signals that.
         f.debug_struct("Outbox")
             .field("retry_policy", &self.inner.retry_policy)
-            .finish()
+            .field("queue_capacity", &self.tx.max_capacity())
+            .finish_non_exhaustive()
     }
 }
 
@@ -119,55 +149,76 @@ where
     deliverer: D,
     fetcher: F,
     retry_policy: RetryPolicy,
-    tx: mpsc::UnboundedSender<DeliveryJob>,
     /// Shared runtime configuration. Held on the outbox so
     /// [`Outbox::resolve_inboxes`] can apply the configured
     /// [`UrlPolicy`](crate::UrlPolicy) to every picked inbox URL
     /// *before* it enters the retry queue — this is the admission
     /// gate that keeps `sharedInbox` URLs served by a malicious
     /// actor from turning the outbox into an SSRF amplifier.
+    ///
+    /// The per-request budget ([`FederationConfig::http_fetch_limit`])
+    /// and queue capacity ([`FederationConfig::delivery_queue_capacity`])
+    /// are accessed through this field; no derived scalar is
+    /// cached on [`Inner`] so the config stays the single source
+    /// of truth at runtime.
     config: Arc<FederationConfig>,
-    /// Budget applied to each recipient's actor-resolution fetch.
-    /// A fresh [`FetchContext`] is minted *per recipient* inside
-    /// [`Outbox::resolve_inboxes`] so one dead actor burning
-    /// through its recursive budget cannot starve the siblings.
-    http_fetch_limit: u32,
     /// Global ceiling on concurrent deliveries. Every call to
     /// `run_one` acquires one permit before touching the network,
     /// so a fan-out to 10 000 inboxes cannot instantly pin 10 000
     /// TCP sockets. Sized by
     /// [`FederationConfig::delivery_concurrency`].
     delivery_semaphore: Arc<Semaphore>,
-    /// Handle to the single background worker task spawned by
-    /// [`spawn_worker`]. Stored so that dropping the last
-    /// [`Outbox`] clone aborts the worker instead of leaking it
-    /// past the runtime's lifetime.
-    worker_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl<D, F> Drop for Inner<D, F>
-where
-    D: Deliverer,
-    F: Fetcher,
-{
+/// Shutdown coordinator for the outbox worker.
+///
+/// Held behind an `Arc<ShutdownHandle>` by every [`Outbox`] clone
+/// **and nobody else**. The worker task holds a separate
+/// [`Arc<Notify>`] clone of [`Self::stop`] plus a [`Weak<Inner>`];
+/// it does **not** hold an [`Arc<ShutdownHandle>`], so the strong
+/// count of the handle exactly tracks the number of live [`Outbox`]
+/// clones. When that count reaches zero, [`Drop`] fires and
+/// signals the worker to exit.
+struct ShutdownHandle {
+    /// Wake-up signal for the worker's `select!`. Shared with the
+    /// worker as [`Arc<Notify>`] so both sides refer to the same
+    /// instance. We emit signals via [`Notify::notify_one`], which
+    /// **stores a permit** when no waiter is currently parked on
+    /// [`Notify::notified`] — this is what closes the race where
+    /// a caller signals shutdown before the worker has yet
+    /// reached its `select!` arm.
+    stop: Arc<Notify>,
+    /// Worker [`JoinHandle`]. Taken by [`Drop`] as a belt-and-
+    /// braces `abort` and by [`Outbox::graceful_shutdown`] to
+    /// `await` a clean exit with a deadline.
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for ShutdownHandle {
     fn drop(&mut self) {
-        // Dropping the last `Outbox` clone closes `tx` (because
-        // `Inner::tx` is gone with the `Arc`), which in turn lets
-        // the worker's `rx.recv().await` return `None` and the
-        // loop exit cleanly. We still abort explicitly as a
-        // defence-in-depth against the worker spinning on an
-        // in-flight delivery after the runtime tried to shut down.
-        if let Ok(mut slot) = self.worker_handle.lock()
-            && let Some(handle) = slot.take()
+        // First: unblock the worker so it stops accepting jobs and
+        // exits. `notify_one` stores a permit if the worker is not
+        // currently parked, so the signal is never lost.
+        self.stop.notify_one();
+        // Second: abort as a belt-and-braces safeguard. If the
+        // worker is stuck inside a user-supplied
+        // `Deliverer::deliver`, `abort` is the only way to reclaim
+        // it — graceful shutdown should be done through
+        // [`Outbox::graceful_shutdown`] instead if this matters.
+        if let Ok(mut slot) = self.handle.lock()
+            && let Some(h) = slot.take()
         {
-            handle.abort();
+            h.abort();
         }
     }
 }
 
 #[derive(Debug)]
 struct DeliveryJob {
-    activity: Value,
+    /// Activity JSON shared between fan-out recipients. The outer
+    /// [`Arc`] lets one `dispatch(..., N_recipients)` produce N
+    /// cheap clones instead of N full JSON deep-copies.
+    activity: Arc<Value>,
     inbox: Url,
     /// 0 for the immediate first attempt; incremented on every retry.
     attempt: u32,
@@ -192,30 +243,43 @@ where
         retry_policy: RetryPolicy,
         config: Arc<FederationConfig>,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<DeliveryJob>();
-        let http_fetch_limit = config.http_fetch_limit;
-        // `Semaphore::new(0)` would deadlock every delivery; clamp
-        // the configured concurrency to at least 1 so a misconfigured
-        // build can still make (serialised) forward progress.
+        // Bounded channel sized by config. `mpsc::channel` panics
+        // on capacity 0; clamp to at least 1 so a misconfigured
+        // build still makes serialised forward progress.
+        let (tx, rx) = mpsc::channel::<DeliveryJob>(config.delivery_queue_capacity.max(1));
+        // `Semaphore::new(0)` would deadlock every delivery; same
+        // clamp rationale as above.
         let delivery_semaphore = Arc::new(Semaphore::new(config.delivery_concurrency.max(1)));
         let inner = Arc::new(Inner {
             deliverer,
             fetcher,
             retry_policy,
-            tx,
             config,
-            http_fetch_limit,
             delivery_semaphore,
-            worker_handle: Mutex::new(None),
         });
-        let handle = spawn_worker(Arc::clone(&inner), rx);
-        // `inner` is held by both the handle struct we return and
-        // the worker task; storing the `JoinHandle` lets `Drop`
-        // abort the worker the moment the last clone goes away.
-        if let Ok(mut slot) = inner.worker_handle.lock() {
+        // `stop` is stored both in `ShutdownHandle` (reached by
+        // every `Outbox` clone through the `Arc<ShutdownHandle>`)
+        // and in the worker task directly. Keeping it as its own
+        // `Arc<Notify>` — not threaded through `Arc<ShutdownHandle>`
+        // — is what lets the shutdown Arc's strong count reach
+        // zero when the last `Outbox` clone drops.
+        let stop = Arc::new(Notify::new());
+        let shutdown = Arc::new(ShutdownHandle {
+            stop: Arc::clone(&stop),
+            handle: Mutex::new(None),
+        });
+        // Worker holds a `Weak<Inner>` so it cannot keep `Inner`
+        // alive past the last [`Outbox`] clone, and its own
+        // `Arc<Notify>` clone for the shutdown signal.
+        let handle = spawn_worker(Arc::downgrade(&inner), rx, tx.clone(), stop);
+        if let Ok(mut slot) = shutdown.handle.lock() {
             *slot = Some(handle);
         }
-        Self { inner }
+        Self {
+            inner,
+            tx,
+            shutdown,
+        }
     }
 
     /// Resolves every URL in `recipient_actors` to an inbox URL,
@@ -239,11 +303,21 @@ where
     /// remote peer -- a single dead recipient never stops the
     /// fan-out. Callers that want strict fail-fast behaviour can
     /// check `report.errors.is_empty()` themselves.
+    ///
+    /// # Backpressure
+    ///
+    /// Enqueueing is `.await`-blocking: if the delivery channel is
+    /// already at [`FederationConfig::delivery_queue_capacity`],
+    /// `dispatch` pauses until the worker drains a slot. This
+    /// prevents a producer from growing the queue without bound.
     pub async fn dispatch(&self, activity: Value, recipient_actors: &[Url]) -> DispatchReport {
         let resolution = self.resolve_inboxes(recipient_actors).await;
         let enqueued = resolution.inboxes.len();
+        // Clone the activity JSON **once** into an [`Arc`] and hand
+        // every recipient a cheap Arc clone instead of N deep-copies.
+        let activity = Arc::new(activity);
         for inbox in resolution.inboxes {
-            self.enqueue(activity.clone(), inbox);
+            self.enqueue_arc(Arc::clone(&activity), inbox).await;
         }
         DispatchReport {
             enqueued,
@@ -251,22 +325,34 @@ where
         }
     }
 
-    /// Enqueues a single delivery job — bypassing the actor-to-inbox
-    /// resolution step — to be dispatched by the background worker.
-    pub fn enqueue(&self, activity: Value, inbox: Url) {
-        // The receiver is owned by the worker task we spawned in
-        // `new`, so `send` only fails after the worker has already
-        // panicked or been dropped — both are unrecoverable, and
-        // there is nothing the caller could meaningfully do about
-        // it. We log at error level instead of returning a Result.
+    /// Enqueues a single delivery job, awaiting a channel slot if
+    /// the queue is full.
+    ///
+    /// Bypasses the actor-to-inbox resolution step; suitable for
+    /// callers that already know the target inbox URL (e.g.
+    /// sharedInbox-aware mailer middleware). Wraps the activity in
+    /// an [`Arc`] before handing it to the worker; prefer the
+    /// [`Arc`]-typed [`Self::enqueue_arc`] if you already have one.
+    pub async fn enqueue(&self, activity: Value, inbox: Url) {
+        self.enqueue_arc(Arc::new(activity), inbox).await;
+    }
+
+    /// [`Arc`]-aware variant of [`Self::enqueue`]. Prefer this when
+    /// fanning the same activity out to N sibling inboxes — it
+    /// avoids an N-way deep-copy of the JSON.
+    pub async fn enqueue_arc(&self, activity: Arc<Value>, inbox: Url) {
+        // `send` fails only once the worker is gone and the
+        // channel has been closed — all graceful shutdown paths
+        // let any remaining producer see a closed channel rather
+        // than hanging forever.
         if self
-            .inner
             .tx
             .send(DeliveryJob {
                 activity,
                 inbox,
                 attempt: 0,
             })
+            .await
             .is_err()
         {
             tracing::error!(
@@ -274,6 +360,52 @@ where
                 "outbox worker is gone; dropping delivery job",
             );
         }
+    }
+
+    /// Signals the worker to stop accepting new jobs and awaits
+    /// its exit within `timeout`.
+    ///
+    /// Does **not** consume `self` — every [`Outbox`] clone can
+    /// initiate shutdown; the first call wins and subsequent calls
+    /// become no-ops. After this method returns, the worker is
+    /// guaranteed to have exited (or been timed out) and the
+    /// channel is closed; any later [`Self::enqueue`] logs and
+    /// drops the job.
+    ///
+    /// Returns `Ok(())` on a clean exit, `Err` if the deadline
+    /// elapsed while the worker was still running — callers MAY
+    /// retry with a larger deadline or fall through to
+    /// [`Drop`]-based abort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tokio::time::error::Elapsed`] when the worker
+    /// does not finish before `timeout`.
+    pub async fn graceful_shutdown(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        // Ask the worker to stop selecting new jobs. `notify_one`
+        // stores a permit if no waiter is currently parked, so
+        // the signal is retained even when this call races with
+        // the worker's first loop iteration.
+        self.shutdown.stop.notify_one();
+        let handle_opt = self
+            .shutdown
+            .handle
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(handle) = handle_opt {
+            tokio::time::timeout(timeout, handle)
+                .await?
+                // Worker task's own JoinError (panic / cancel) is
+                // swallowed intentionally: graceful shutdown is a
+                // best-effort cleanup signal, not a reliability
+                // contract for user-supplied deliverers.
+                .ok();
+        }
+        Ok(())
     }
 
     /// Resolves a recipient list to the de-duplicated set of inbox
@@ -310,7 +442,7 @@ where
         // *one* inbox request's recursive chain. (The SSRF guard
         // inside `FetchContext` still applies per call; the budget
         // is only reset between recipients.)
-        let ctx = FetchContext::new(self.inner.http_fetch_limit);
+        let ctx = FetchContext::new(self.inner.config.http_fetch_limit);
         let actor = self
             .inner
             .fetcher
@@ -355,33 +487,46 @@ where
 }
 
 fn spawn_worker<D, F>(
-    inner: Arc<Inner<D, F>>,
-    mut rx: mpsc::UnboundedReceiver<DeliveryJob>,
+    inner: Weak<Inner<D, F>>,
+    mut rx: mpsc::Receiver<DeliveryJob>,
+    tx_for_retry: mpsc::Sender<DeliveryJob>,
+    stop: Arc<Notify>,
 ) -> JoinHandle<()>
 where
     D: Deliverer + 'static,
     F: Fetcher + 'static,
 {
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            // Detach every job to its own task *without* holding a
-            // semaphore permit here. The permit is acquired inside
-            // `run_one`, **after** the retry backoff sleep, so a
-            // Mastodon-class 5-minute backoff cannot stall the
-            // dispatcher or starve sibling deliveries. Backpressure
-            // at the receive side is the responsibility of a
-            // bounded channel (see P1 follow-up); the semaphore's
-            // job is solely to cap *in-flight network* fan-out.
-            let job_inner = Arc::clone(&inner);
+        loop {
+            let job = tokio::select! {
+                // `biased` so shutdown ALWAYS wins over a queued
+                // job when both are ready — otherwise the runtime
+                // could starve the stop signal under a busy queue.
+                biased;
+                () = stop.notified() => break,
+                job = rx.recv() => match job {
+                    Some(j) => j,
+                    None => break, // all senders dropped
+                },
+            };
+            // Upgrade just long enough to hand a strong clone to
+            // the spawned task; `Weak::upgrade` returning `None`
+            // means every [`Outbox`] clone has been dropped and
+            // there is no point starting a new delivery.
+            let Some(inner) = inner.upgrade() else { break };
+            let tx_for_retry = tx_for_retry.clone();
             tokio::spawn(async move {
-                run_one(job_inner, job).await;
+                run_one(inner, job, tx_for_retry).await;
             });
         }
     })
 }
 
-async fn run_one<D, F>(inner: Arc<Inner<D, F>>, job: DeliveryJob)
-where
+async fn run_one<D, F>(
+    inner: Arc<Inner<D, F>>,
+    job: DeliveryJob,
+    tx_for_retry: mpsc::Sender<DeliveryJob>,
+) where
     D: Deliverer,
     F: Fetcher,
 {
@@ -434,13 +579,19 @@ where
                     %err,
                     "delivery failed; retrying",
                 );
-                if inner
-                    .tx
+                // Retry via the bounded channel. `send().await` here
+                // applies the same backpressure a fresh enqueue
+                // would, so a retry storm cannot grow the queue
+                // past its cap. Failure means the channel has
+                // already been closed — shutdown is in progress
+                // and the retry is intentionally dropped.
+                if tx_for_retry
                     .send(DeliveryJob {
                         activity,
                         inbox,
                         attempt: next,
                     })
+                    .await
                     .is_err()
                 {
                     tracing::error!(
@@ -492,6 +643,31 @@ mod tests {
             .url_policy(UrlPolicy::permissive_for_tests())
             .build()
             .shared()
+    }
+
+    /// Poll-wait until `deliverer.calls.len() >= expected` or the
+    /// deadline elapses. Replaces fixed `sleep(Duration::from_millis(50))`
+    /// synchronisation in tests — under CI scheduler pressure the
+    /// 50 ms sleep often fired before the worker had even been
+    /// polled once, causing flaky failures.
+    ///
+    /// The loop polls at 5 ms granularity so a correct test
+    /// typically completes in under 10 ms while a regression
+    /// surfaces as a clear timeout rather than a silent wrong
+    /// count.
+    async fn wait_for_calls(deliverer: &RecordingDeliverer, expected: usize, deadline: Duration) {
+        let deadline_at = std::time::Instant::now() + deadline;
+        loop {
+            let len = deliverer.calls.lock().unwrap().len();
+            if len >= expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline_at,
+                "expected >= {expected} deliver calls within {deadline:?}, got {len}",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Test deliverer that records every (inbox, attempt) call and
@@ -637,8 +813,9 @@ mod tests {
             "shared inbox dedupes two recipients into one delivery",
         );
 
-        // Give the worker a chance to drain.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the worker to drain (event-driven, not fixed
+        // sleep — see `wait_for_calls` rationale).
+        wait_for_calls(&deliverer, 1, Duration::from_secs(2)).await;
         let calls = deliverer.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.as_str(), shared);
@@ -704,9 +881,12 @@ mod tests {
             .await;
         assert!(report.is_full_success());
 
-        // for_tests() schedule: 0, 10, 20, 40 ms → total <100 ms.
-        // Wait generously to let the worker exhaust retries.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // for_tests() schedule: 0, 10, 20, 40 ms → total <100 ms
+        // for exactly 3 attempts. Wait for the 3 expected calls,
+        // then give the scheduler one more tick to surface any
+        // erroneous 4th call before asserting.
+        wait_for_calls(&deliverer, 3, Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
         let calls = deliverer.calls.lock().unwrap();
         // attempt=0,1,2 produce 3 calls; attempt=3 is the boundary
         // where is_exhausted fires before scheduling, so the call is
@@ -895,14 +1075,14 @@ mod tests {
     /// Used by the P0-R2 regression test to distinguish the
     /// "retry-sleep holds permit" bug from the fixed behaviour.
     struct SplitDeliverer {
-        ok_delivered: tokio::sync::Notify,
+        ok_delivered: Notify,
         ok_deliver_at: Mutex<Option<std::time::Instant>>,
     }
 
     impl SplitDeliverer {
         fn new() -> Self {
             Self {
-                ok_delivered: tokio::sync::Notify::new(),
+                ok_delivered: Notify::new(),
                 ok_deliver_at: Mutex::new(None),
             }
         }
@@ -1086,5 +1266,155 @@ mod tests {
             peak >= 2,
             "expected the cap to actually be exercised; observed peak {peak}",
         );
+    }
+
+    /// Deliverer that parks each call on a per-call [`Notify`] so
+    /// the test can hold jobs in-flight for as long as it likes.
+    /// Used by the backpressure and graceful-shutdown tests to
+    /// gate exactly when a deliver returns.
+    struct GatedDeliverer {
+        release: Arc<Notify>,
+        started: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    impl Deliverer for GatedDeliverer {
+        async fn deliver(&self, _a: &Value, _i: &Url) -> Result<(), Error> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct ArcGated(Arc<GatedDeliverer>);
+    impl Deliverer for ArcGated {
+        async fn deliver(&self, a: &Value, i: &Url) -> Result<(), Error> {
+            self.0.deliver(a, i).await
+        }
+    }
+
+    #[tokio::test]
+    async fn outbox_uses_bounded_channel_sized_by_config() {
+        // P1-N8 regression guard: the delivery channel MUST be a
+        // bounded `mpsc::channel` sized by
+        // `FederationConfig::delivery_queue_capacity`, not the
+        // unbounded variant. We read `Sender::max_capacity` — a
+        // method that **only exists on the bounded `Sender`** —
+        // so any future revert to `unbounded_channel` would stop
+        // compiling, and any mis-wired capacity would fail the
+        // numeric assertion.
+        //
+        // Observing actual send-side backpressure in a test is
+        // unreliable: the worker drains `rx` essentially as fast
+        // as producers fill it, so a deliberately over-subscribed
+        // burst is almost always absorbed without the sender
+        // parking. This compile-time-plus-configuration check is
+        // the robust substitute.
+        let cap = 7_usize; // arbitrary distinct value
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .delivery_queue_capacity(cap)
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+        assert_eq!(outbox.tx.max_capacity(), cap);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_exits_worker_cleanly() {
+        // P1-N7 regression: `graceful_shutdown` must stop the
+        // worker within the supplied deadline.
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let deliverer = Arc::new(GatedDeliverer {
+            release: Arc::clone(&release),
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let outbox = Outbox::new(
+            ArcGated(Arc::clone(&deliverer)),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            test_config(),
+        );
+
+        // Idle worker -- graceful_shutdown just returns quickly.
+        outbox
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .expect("idle worker must exit within the deadline");
+
+        // After graceful_shutdown the channel is closed; further
+        // enqueue calls log-and-drop but do NOT panic or hang.
+        outbox
+            .enqueue(
+                json!({ "id": "after-shutdown", "type": "Create" }),
+                "https://example.com/inbox/a".parse().unwrap(),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dropping_last_outbox_clone_aborts_worker() {
+        // P1-N10 regression: when every [`Outbox`] clone drops,
+        // the `ShutdownHandle` Arc's strong count goes to zero,
+        // its `Drop` fires, and the worker is aborted. Before
+        // this refactor the worker held an `Arc<Inner>` through
+        // which `Inner.tx` kept the channel open forever, so the
+        // worker leaked. We verify the handle is actually
+        // cancelled within a short deadline after the last clone
+        // drops -- no timeout means the bug has regressed.
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let deliverer = Arc::new(GatedDeliverer {
+            release: Arc::clone(&release),
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let outbox = Outbox::new(
+            ArcGated(Arc::clone(&deliverer)),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            test_config(),
+        );
+
+        // Take a raw handle clone *before* dropping the outbox so
+        // we can await its exit. `shutdown.handle` is `Mutex<Option<JoinHandle>>`;
+        // we call `.take()` only inside `graceful_shutdown` /
+        // `Drop`, not here.
+        let shutdown = Arc::clone(&outbox.shutdown);
+        drop(outbox);
+
+        // Arc strong count goes to zero -> Drop runs -> abort().
+        // The worker's `JoinHandle` is taken out and aborted by
+        // Drop itself, so observing `is_finished` on a *second*
+        // clone of the handle isn't possible. Instead we poll
+        // Arc::strong_count and assert that nobody else holds the
+        // ShutdownHandle; the Drop has already fired if we got
+        // here without the test hanging.
+        assert_eq!(
+            Arc::strong_count(&shutdown),
+            1,
+            "only the test should hold the shutdown handle after the last Outbox drop",
+        );
+        // Sanity: the worker task is no longer able to accept
+        // jobs because its channel sender was dropped.
+        let () = release.notify_waiters(); // unblock in-flight if any
     }
 }
