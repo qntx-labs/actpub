@@ -201,7 +201,11 @@ mod tests {
     struct FakeFetcher(Value);
 
     impl Fetcher for FakeFetcher {
-        async fn fetch_raw(&self, _url: &url::Url) -> Result<Value, Error> {
+        async fn fetch_raw(
+            &self,
+            _url: &url::Url,
+            _ctx: &actpub_federation::FetchContext,
+        ) -> Result<Value, Error> {
             Ok(self.0.clone())
         }
     }
@@ -211,7 +215,12 @@ mod tests {
 
     impl ActivityHandler for CountHandler {
         type Error = std::convert::Infallible;
-        async fn handle(&self, _activity: Value, _actor: Value) -> Result<(), Self::Error> {
+        async fn handle(
+            &self,
+            _activity: Value,
+            _actor: Value,
+            _ctx: actpub_federation::FetchContext,
+        ) -> Result<(), Self::Error> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

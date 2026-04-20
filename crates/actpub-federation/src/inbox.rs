@@ -70,6 +70,7 @@ use url::Url;
 
 use crate::config::FederationConfig;
 use crate::error::Error;
+use crate::fetch_ctx::FetchContext;
 use crate::fetcher::Fetcher;
 
 /// User-supplied callback invoked once per verified activity.
@@ -80,6 +81,15 @@ use crate::fetcher::Fetcher;
 /// - the HTTP signature was verified against `signing_actor`'s
 ///   public key;
 /// - the activity has not been seen by this pipeline instance before.
+///
+/// The [`FetchContext`] passed to `handle` represents the **same**
+/// per-request budget the pipeline used to resolve the signing
+/// actor, so recursive dereferencing the handler performs (walking
+/// `object.inReplyTo`, dereferencing mentioned actors, …) is
+/// tracked against a single
+/// [`FederationConfig::http_fetch_limit`](crate::FederationConfig::http_fetch_limit)
+/// ceiling. Handlers that do not perform further fetches can
+/// simply ignore the parameter.
 pub trait ActivityHandler: Send + Sync {
     /// User-defined error type. Constrained to `'static + Display`
     /// so the pipeline can surface it through `tracing` without
@@ -97,6 +107,7 @@ pub trait ActivityHandler: Send + Sync {
         &self,
         activity: Value,
         signing_actor: Value,
+        ctx: FetchContext,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -205,7 +216,12 @@ where
         verify_body_integrity(parts, &body)?;
         let key_id = extract_key_id(parts)?;
         let actor_url = strip_fragment(&key_id)?;
-        let signing_actor = self.inner.fetcher.fetch_raw(&actor_url).await?;
+        // Budget every HTTP fetch the pipeline (and the user
+        // handler) will perform for this one inbox POST against a
+        // single counter. Actor resolution counts as one; the
+        // handler inherits the remainder of the budget.
+        let ctx = FetchContext::new(self.inner.config.http_fetch_limit);
+        let signing_actor = self.inner.fetcher.fetch_raw(&actor_url, &ctx).await?;
         enforce_actor_domain_matches_key_id(&signing_actor, &key_id)?;
         let verifying_key = pick_verifying_key(&signing_actor, &key_id)?;
 
@@ -233,7 +249,7 @@ where
 
         self.inner
             .handler
-            .handle(activity, signing_actor)
+            .handle(activity, signing_actor, ctx)
             .await
             .map_err(|e| Error::HandlerFailed(e.to_string()))?;
 
@@ -486,7 +502,7 @@ mod tests {
     struct FakeFetcher(Value);
 
     impl Fetcher for FakeFetcher {
-        async fn fetch_raw(&self, _url: &Url) -> Result<Value, Error> {
+        async fn fetch_raw(&self, _url: &Url, _ctx: &FetchContext) -> Result<Value, Error> {
             Ok(self.0.clone())
         }
     }
@@ -499,7 +515,12 @@ mod tests {
 
     impl ActivityHandler for CountHandler {
         type Error = std::convert::Infallible;
-        async fn handle(&self, _activity: Value, _actor: Value) -> Result<(), Self::Error> {
+        async fn handle(
+            &self,
+            _activity: Value,
+            _actor: Value,
+            _ctx: FetchContext,
+        ) -> Result<(), Self::Error> {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

@@ -117,4 +117,56 @@ pub enum Error {
     /// so [`Outbox`](crate::Outbox) cannot deliver to it.
     #[error("actor `{0}` has no `inbox` or `sharedInbox` endpoint")]
     ActorWithoutInbox(String),
+
+    /// A single inbox request triggered more recursive HTTP fetches
+    /// than [`FederationConfig::http_fetch_limit`](crate::FederationConfig::http_fetch_limit)
+    /// allows.
+    ///
+    /// This is the load-shedding guard for the AP
+    /// [Security Considerations §B.5 recursive fetch DoS]
+    /// scenario: a malicious peer builds an activity whose `object`
+    /// points at another object on a third server, whose `inReplyTo`
+    /// points at a fourth, and so on. Without a counter the inbox
+    /// handler can be induced to perform an unbounded chain of
+    /// signed fetches.
+    ///
+    /// [Security Considerations §B.5 recursive fetch DoS]: https://www.w3.org/TR/activitypub/#security-recursive
+    #[error("recursive fetch limit ({limit}) exceeded for this request")]
+    RecursiveFetchLimit {
+        /// Configured limit at the moment of failure.
+        limit: u32,
+    },
+
+    /// The JSON returned by a fetch had an `id` field that did not
+    /// match the final response URL (after a single permitted
+    /// redirect hop).
+    ///
+    /// The classic Mastodon `GHSA-jhrq-qvrm-qr36` URL-rebinding
+    /// shape: an attacker controlling `victim.example` returns
+    /// `{"id": "https://attacker.example/u/me"}` so that a credulous
+    /// consumer caches the attacker's document under the victim's
+    /// URL. This variant is raised when that mismatch cannot be
+    /// resolved by a same-domain re-fetch.
+    #[error("response from `{url}` declared id `{id}` (cross-domain mismatch)")]
+    FetchIdMismatch {
+        /// Wire URL the response was fetched from.
+        url: Url,
+        /// The `id` field the response itself declared.
+        id: Url,
+    },
+
+    /// An HTTP 3xx response's `Location` pointed at a URL that the
+    /// configured [`UrlPolicy`](crate::UrlPolicy) rejected, or the
+    /// response chained more redirects than the runtime is willing
+    /// to follow (exactly one, per
+    /// [ActivityPub §B.5](https://www.w3.org/TR/activitypub/#security-considerations)).
+    #[error("redirect from `{from}` to `{to}` was rejected: {reason}")]
+    RedirectRejected {
+        /// URL that produced the redirect.
+        from: Url,
+        /// Target URL named by the `Location` header.
+        to: String,
+        /// Human-readable explanation.
+        reason: String,
+    },
 }

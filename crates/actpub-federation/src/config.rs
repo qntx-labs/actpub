@@ -34,6 +34,15 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 20;
 /// Default in-memory cache size (1024 entries).
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1024;
 
+/// Default cap on the number of recursive HTTP fetches a single
+/// inbox request or activity resolution is allowed to trigger.
+///
+/// Mirrors Lemmy's `activitypub-federation` default and the rough
+/// upper bound under which every mainstream Fediverse object graph
+/// can be traversed without giving up `ActivityPub` Security
+/// Considerations §B.5 `DoS` protection.
+pub const DEFAULT_HTTP_FETCH_LIMIT: u32 = 20;
+
 /// Default cache TTL (10 minutes) — short enough that a key rotation
 /// reaches verifiers quickly, long enough that a hot inbox does not
 /// re-fetch the same actor on every delivery.
@@ -103,6 +112,14 @@ pub struct FederationConfig {
     /// fetch" / "secure mode" feature). `false` by default.
     #[builder(default = false)]
     pub signed_fetch: bool,
+
+    /// Maximum number of recursive HTTP fetches a single inbox
+    /// request or activity resolution is allowed to trigger.
+    /// Defaults to [`DEFAULT_HTTP_FETCH_LIMIT`]. Set to `0` to
+    /// forbid **any** outbound fetch for the scope sharing the
+    /// counter (primarily useful in tests).
+    #[builder(default = DEFAULT_HTTP_FETCH_LIMIT)]
+    pub http_fetch_limit: u32,
 }
 
 impl FederationConfig {

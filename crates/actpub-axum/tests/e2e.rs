@@ -44,7 +44,11 @@ use url::Url;
 struct StaticFetcher(Value);
 
 impl Fetcher for StaticFetcher {
-    async fn fetch_raw(&self, _url: &Url) -> Result<Value, FederationError> {
+    async fn fetch_raw(
+        &self,
+        _url: &Url,
+        _ctx: &actpub_federation::FetchContext,
+    ) -> Result<Value, FederationError> {
         Ok(self.0.clone())
     }
 }
@@ -57,7 +61,12 @@ struct CaptureHandler {
 
 impl ActivityHandler for CaptureHandler {
     type Error = std::convert::Infallible;
-    async fn handle(&self, activity: Value, actor: Value) -> Result<(), Self::Error> {
+    async fn handle(
+        &self,
+        activity: Value,
+        actor: Value,
+        _ctx: actpub_federation::FetchContext,
+    ) -> Result<(), Self::Error> {
         self.captured.lock().await.push((activity, actor));
         Ok(())
     }
@@ -294,7 +303,12 @@ struct SharedHandler(Arc<CaptureHandler>);
 
 impl ActivityHandler for SharedHandler {
     type Error = std::convert::Infallible;
-    async fn handle(&self, activity: Value, actor: Value) -> Result<(), Self::Error> {
+    async fn handle(
+        &self,
+        activity: Value,
+        actor: Value,
+        _ctx: actpub_federation::FetchContext,
+    ) -> Result<(), Self::Error> {
         self.0.captured.lock().await.push((activity, actor));
         Ok(())
     }

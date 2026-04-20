@@ -31,6 +31,7 @@ use url::Url;
 
 use crate::deliver::Deliverer;
 use crate::error::Error;
+use crate::fetch_ctx::FetchContext;
 use crate::fetcher::Fetcher;
 use crate::retry::RetryPolicy;
 
@@ -117,6 +118,12 @@ where
     fetcher: F,
     retry_policy: RetryPolicy,
     tx: mpsc::UnboundedSender<DeliveryJob>,
+    /// Budget applied to the actor-resolution fetches performed by
+    /// [`Outbox::resolve_inboxes`]. One context is shared across
+    /// all recipients of a single `dispatch` call so that a
+    /// recipient list of 2,000 actors cannot exhaust resources via
+    /// 2,000 independent recursive chains.
+    http_fetch_limit: u32,
 }
 
 #[derive(Debug)]
@@ -138,14 +145,20 @@ where
     ///
     /// Spawns one background tokio task; consequently MUST be called
     /// from inside a tokio runtime context.
+    ///
+    /// `http_fetch_limit` is the ceiling shared between all actor
+    /// resolutions inside one [`Self::dispatch`] call — typically
+    /// sourced from
+    /// [`FederationConfig::http_fetch_limit`](crate::FederationConfig::http_fetch_limit).
     #[must_use]
-    pub fn new(deliverer: D, fetcher: F, retry_policy: RetryPolicy) -> Self {
+    pub fn new(deliverer: D, fetcher: F, retry_policy: RetryPolicy, http_fetch_limit: u32) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<DeliveryJob>();
         let inner = Arc::new(Inner {
             deliverer,
             fetcher,
             retry_policy,
             tx,
+            http_fetch_limit,
         });
         spawn_worker(Arc::clone(&inner), rx);
         Self { inner }
@@ -220,8 +233,12 @@ where
     /// Fediverse server.
     pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> InboxResolution {
         let mut resolution = InboxResolution::default();
+        // One budget for the whole recipient list: a huge `to` / `cc`
+        // with one recipient per expensive-to-resolve host cannot
+        // linearly blow up the fetch count.
+        let ctx = FetchContext::new(self.inner.http_fetch_limit);
         for actor_url in recipient_actors {
-            match self.inner.fetcher.fetch_raw(actor_url).await {
+            match self.inner.fetcher.fetch_raw(actor_url, &ctx).await {
                 Ok(actor) => match pick_inbox(&actor, actor_url) {
                     Ok(inbox) => {
                         resolution.inboxes.insert(inbox);
@@ -388,7 +405,7 @@ mod tests {
     }
 
     impl Fetcher for StaticFetcher {
-        async fn fetch_raw(&self, url: &Url) -> Result<Value, Error> {
+        async fn fetch_raw(&self, url: &Url, _ctx: &FetchContext) -> Result<Value, Error> {
             self.actors
                 .get(url.as_str())
                 .cloned()
@@ -471,6 +488,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
+            crate::DEFAULT_HTTP_FETCH_LIMIT,
         );
 
         let activity = json!({ "id": "https://send.example/a/1", "type": "Create" });
@@ -512,6 +530,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
+            crate::DEFAULT_HTTP_FETCH_LIMIT,
         );
 
         let report = outbox
@@ -545,6 +564,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
+            crate::DEFAULT_HTTP_FETCH_LIMIT,
         );
 
         let report = outbox
@@ -584,6 +604,7 @@ mod tests {
             ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
+            crate::DEFAULT_HTTP_FETCH_LIMIT,
         );
         let report = outbox
             .dispatch(
@@ -615,6 +636,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
+            crate::DEFAULT_HTTP_FETCH_LIMIT,
         );
         let report = outbox
             .dispatch(

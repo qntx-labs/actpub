@@ -23,6 +23,10 @@
     clippy::error_impl_error,
     reason = "`Error` is the idiomatic name for the crate's top-level error enum, matching the `thiserror` convention used pervasively in the Rust ecosystem"
 )]
+#![allow(
+    clippy::result_large_err,
+    reason = "Every error variant is rich with context (Url, String, transport cause) required for Fediverse operator triage; boxing the whole enum would complicate the happy path for no measurable benefit on the always-cold error path"
+)]
 #![cfg_attr(
     test,
     allow(
@@ -36,6 +40,7 @@
 mod config;
 mod deliver;
 mod error;
+mod fetch_ctx;
 mod fetcher;
 mod inbox;
 mod outbox;
@@ -60,11 +65,12 @@ use tracing as _;
 use wiremock as _;
 
 pub use self::config::{
-    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_REQUEST_TIMEOUT,
-    FederationConfig, default_user_agent,
+    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL, DEFAULT_HTTP_FETCH_LIMIT,
+    DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_REQUEST_TIMEOUT, FederationConfig, default_user_agent,
 };
 pub use self::deliver::{Deliverer, ReqwestDeliverer};
 pub use self::error::Error;
+pub use self::fetch_ctx::FetchContext;
 pub use self::fetcher::{
     AP_ACCEPT_HEADER, AP_CONTENT_TYPE, Fetcher, LD_CONTENT_TYPE_PREFIX, ReqwestFetcher,
     signed_fetch_signature_header,
