@@ -13,6 +13,7 @@ http = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+sfv = { workspace = true }
 
 aws-lc-rs = { workspace = true }
 pkcs8 = { workspace = true }

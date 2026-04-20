@@ -62,9 +62,11 @@
 )]
 
 mod cavage;
+mod content_digest;
 mod digest;
 mod error;
 mod key;
+mod rfc9421;
 
 use bytes as _;
 use chrono as _;
@@ -79,11 +81,19 @@ pub use self::cavage::{
     CavageHeaderParams, CavageHeaderSet, CavageSigner, CavageVerified, DEFAULT_HEADER_SET,
     SIGNATURE_HEADER, cavage_verify,
 };
+pub use self::content_digest::{
+    CONTENT_DIGEST_HEADER, content_digest_header, verify_content_digest_header,
+};
 pub use self::digest::{SHA256_DIGEST_PREFIX, sha256_digest_header, verify_digest_header};
 pub use self::error::Error;
 pub use self::key::{
     Algorithm, Ed25519PublicKey, Ed25519SigningKey, Multikey, RsaBits, RsaPublicKey, RsaSigningKey,
     SigningKey, VerifyingKey,
+};
+pub use self::rfc9421::{
+    Component, DEFAULT_COMPONENTS as RFC9421_DEFAULT_COMPONENTS, Rfc9421Signer, Rfc9421Verified,
+    SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_dict, parse_signature_input_dict,
+    rfc9421_verify, serialise_signature_dict, serialise_signature_input_dict,
 };
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].
