@@ -1,25 +1,46 @@
 //! Core `ActivityPub` protocol layer.
 //!
-//! Defines the three fundamental traits that drive federation:
+//! Sits one rung above the wire-format crates (`actpub-activitystreams`,
+//! `actpub-httpsig`) and one rung below the `actpub-federation` runtime.
+//! Its job is to bind cryptographic primitives to the on-the-wire data
+//! model so that higher layers can speak in the language of "signed
+//! `ActivityPub` objects" rather than "JSON blobs and detached signatures".
 //!
-//! - [`Object`] — anything addressable by an `ActivityPub` `id` URI, with
-//!   database <-> wire conversion
-//! - [`Actor`] — an `Object` that owns cryptographic keys and mailboxes
-//! - [`Activity`] — a verb applied to an object, with verification and
-//!   side-effect semantics
+//! # What this crate provides
 //!
-//! Additionally, this crate implements the two core security-related FEPs:
+//! - [`eddsa_jcs`] — the [FEP-8b32] / [W3C VC-DI EdDSA] `eddsa-jcs-2022`
+//!   cryptosuite (object-level signing for Mitra / Takahē / Mastodon
+//!   4.5+).
+//! - [`jcs`] — RFC 8785 JSON Canonicalisation Scheme helper.
 //!
-//! - [FEP-521a] — Multikey representation of actor public keys
-//! - [FEP-8b32] — Data Integrity Proofs (`eddsa-jcs-2022`)
+//! Higher-level federation runtime concerns (typed URL fetching,
+//! delivery queue, inbox pipeline) live in `actpub-federation`.
 //!
-//! [FEP-521a]: https://codeberg.org/fediverse/fep/src/branch/main/fep/521a/fep-521a.md
 //! [FEP-8b32]: https://codeberg.org/fediverse/fep/src/branch/main/fep/8b32/fep-8b32.md
+//! [W3C VC-DI EdDSA]: https://www.w3.org/TR/vc-di-eddsa/
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(
-    unused_crate_dependencies,
-    dead_code,
-    unused_imports,
-    missing_docs,
-    reason = "crate is a scaffold; dependencies are declared up-front so that implementation work in later phases does not churn the manifest. Remove this allow once the crate has concrete items."
+    clippy::error_impl_error,
+    reason = "`Error` is the idiomatic name for the crate's top-level error enum, matching the `thiserror` convention used pervasively in the Rust ecosystem"
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used,
+        reason = "JSON / byte field indexing via `[\"key\"]` or `[0]` is ergonomic inside tests, and `panic!` / `unwrap()` are the idiomatic way to assert expectations with a failure message when a fixture is wrong"
+    )
+)]
+
+pub mod eddsa_jcs;
+mod error;
+pub mod jcs;
+
+use serde as _;
+use tracing as _;
+
+pub use self::error::Error;
+
+/// Crate [`Result`] alias with the default error type set to [`Error`].
+pub type Result<T, E = Error> = core::result::Result<T, E>;

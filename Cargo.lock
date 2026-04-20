@@ -55,14 +55,14 @@ version = "0.1.0"
 dependencies = [
  "actpub-activitystreams",
  "actpub-httpsig",
- "bytes",
+ "aws-lc-rs",
  "chrono",
+ "multibase",
  "pretty_assertions",
  "serde",
  "serde_jcs",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "url",
 ]
