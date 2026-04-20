@@ -112,11 +112,12 @@ fn federation_config() -> Arc<FederationConfig> {
 }
 
 /// Builds the full federated service with every router merged in.
-fn build_app(
-    actor_for_signature: Value,
-    handler: CaptureHandler,
-) -> (Router, Arc<CaptureHandler>) {
-    let pipeline = InboxPipeline::new(StaticFetcher(actor_for_signature), handler, federation_config());
+fn build_app(actor_for_signature: Value, handler: CaptureHandler) -> (Router, Arc<CaptureHandler>) {
+    let pipeline = InboxPipeline::new(
+        StaticFetcher(actor_for_signature),
+        handler,
+        federation_config(),
+    );
     let captured: Arc<CaptureHandler> = Arc::new(CaptureHandler::default());
     let app = Router::new()
         .merge(inbox_router(InboxState::new(pipeline)))
@@ -136,7 +137,10 @@ fn signed_inbox_post(activity: &Value) -> (Request<Body>, VerifyingKey) {
         .method(Method::POST)
         .uri(url)
         .header("host", "recv.example.com")
-        .header("date", httpdate::fmt_http_date(std::time::SystemTime::now()))
+        .header(
+            "date",
+            httpdate::fmt_http_date(std::time::SystemTime::now()),
+        )
         .header("content-type", "application/activity+json")
         .header("digest", sha256_digest_header(&body))
         .header(
@@ -215,7 +219,9 @@ async fn merged_app_serves_inbox_webfinger_and_nodeinfo_in_one_service() {
     assert_eq!(nf_resp.status(), StatusCode::OK);
     let bytes = nf_resp.into_body().collect().await.unwrap().to_bytes();
     let disco_doc: Value = serde_json::from_slice(&bytes).unwrap();
-    let links = disco_doc["links"].as_array().expect("discovery links array");
+    let links = disco_doc["links"]
+        .as_array()
+        .expect("discovery links array");
     assert_eq!(links.len(), 2, "discovery exposes both 2.0 and 2.1");
 
     // 4. NodeInfo schema 2.1 — returns the per-version document with
@@ -233,8 +239,7 @@ async fn merged_app_serves_inbox_webfinger_and_nodeinfo_in_one_service() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(
-        nf21_ct
-            .contains(r#"profile="http://nodeinfo.diaspora.software/ns/schema/2.1""#),
+        nf21_ct.contains(r#"profile="http://nodeinfo.diaspora.software/ns/schema/2.1""#),
         "schema 2.1 carries its versioned profile parameter: {nf21_ct}",
     );
 }
@@ -272,9 +277,15 @@ async fn inbox_post_flows_into_user_handler_with_verified_payload() {
     };
     assert_eq!(snapshot.len(), 1, "handler invoked exactly once");
     let (got_activity, got_actor) = &snapshot[0];
-    assert_eq!(got_activity["id"], json!("https://send.example.com/activities/02"));
+    assert_eq!(
+        got_activity["id"],
+        json!("https://send.example.com/activities/02")
+    );
     assert_eq!(got_activity["type"], json!("Create"));
-    assert_eq!(got_actor["id"], json!("https://send.example.com/users/alice"));
+    assert_eq!(
+        got_actor["id"],
+        json!("https://send.example.com/users/alice")
+    );
 }
 
 /// Test handler that delegates to a shared [`CaptureHandler`] so the

@@ -41,8 +41,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::Method;
 use moka::future::Cache;
-use reqwest::{Client, ClientBuilder};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::{Client, ClientBuilder};
 use serde::de::DeserializeOwned;
 use url::Url;
 
@@ -54,8 +54,7 @@ use crate::error::Error;
 /// Lists both the modern `application/activity+json` and the JSON-LD
 /// profile media type so implementations that emit either shape
 /// (Mastodon vs Lemmy) can service us with their canonical document.
-pub const AP_ACCEPT_HEADER: &str =
-    "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"";
+pub const AP_ACCEPT_HEADER: &str = "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"";
 
 /// Bare `ActivityPub` media type sent by Mastodon for actor /
 /// activity JSON.
@@ -82,7 +81,8 @@ pub trait Fetcher: Send + Sync {
     /// May return any [`Error`] variant depending on whether the
     /// failure originated from URL policy, transport, status code,
     /// content-type validation, body size cap, or JSON parsing.
-    fn fetch_raw(&self, url: &Url) -> impl Future<Output = Result<serde_json::Value, Error>> + Send;
+    fn fetch_raw(&self, url: &Url)
+    -> impl Future<Output = Result<serde_json::Value, Error>> + Send;
 
     /// Convenience that fetches `url` and deserialises into `T`.
     ///
@@ -243,7 +243,10 @@ fn sign_get_request(
         .method(Method::GET)
         .uri(url.as_str())
         .header("host", url.host_str().unwrap_or(""))
-        .header("date", httpdate::fmt_http_date(std::time::SystemTime::now()))
+        .header(
+            "date",
+            httpdate::fmt_http_date(std::time::SystemTime::now()),
+        )
         .body(Vec::<u8>::new())
         .map_err(|e| Error::PolicyViolation {
             url: url.clone(),
@@ -278,7 +281,10 @@ pub fn signed_fetch_signature_header(
         .method(Method::GET)
         .uri(url.as_str())
         .header("host", url.host_str().unwrap_or(""))
-        .header("date", httpdate::fmt_http_date(std::time::SystemTime::now()))
+        .header(
+            "date",
+            httpdate::fmt_http_date(std::time::SystemTime::now()),
+        )
         .header("digest", sha256_digest_header(&body))
         .body(body)
         .map_err(|e| Error::PolicyViolation {

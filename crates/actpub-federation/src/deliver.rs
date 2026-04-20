@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use actpub_httpsig::{
-    CavageSigner, CONTENT_DIGEST_HEADER, DigestAlgorithm, content_digest_header_with,
+    CONTENT_DIGEST_HEADER, CavageSigner, DigestAlgorithm, content_digest_header_with,
     sha256_digest_header,
 };
 use http::Method;
@@ -229,7 +229,9 @@ mod tests {
     #[tokio::test]
     async fn deliver_rejects_non_2xx_with_status_error() {
         let server = MockServer::start().await;
-        let inbox: Url = format!("{}/users/dead/inbox", server.uri()).parse().unwrap();
+        let inbox: Url = format!("{}/users/dead/inbox", server.uri())
+            .parse()
+            .unwrap();
         Mock::given(method("POST"))
             .and(path("/users/dead/inbox"))
             .respond_with(ResponseTemplate::new(500))

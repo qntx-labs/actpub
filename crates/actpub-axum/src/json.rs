@@ -39,7 +39,11 @@ impl<T: Serialize> IntoResponse for FederationJson<T> {
                 .into_response(),
             Err(err) => {
                 tracing::error!(target: "actpub::axum", %err, "FederationJson serialisation failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "JSON serialisation failed").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "JSON serialisation failed",
+                )
+                    .into_response()
             }
         }
     }

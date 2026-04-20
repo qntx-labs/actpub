@@ -176,10 +176,7 @@ where
     ///
     /// Returns the first fetcher error or
     /// [`Error::ActorWithoutInbox`].
-    pub async fn resolve_inboxes(
-        &self,
-        recipient_actors: &[Url],
-    ) -> Result<HashSet<Url>, Error> {
+    pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> Result<HashSet<Url>, Error> {
         let mut inboxes: HashSet<Url> = HashSet::new();
         for actor_url in recipient_actors {
             let actor = self.inner.fetcher.fetch_raw(actor_url).await?;
@@ -308,7 +305,10 @@ mod tests {
 
     impl Deliverer for RecordingDeliverer {
         async fn deliver(&self, activity: &Value, inbox: &Url) -> Result<(), Error> {
-            self.calls.lock().unwrap().push((inbox.clone(), activity.clone()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((inbox.clone(), activity.clone()));
             if self.fail_first_n.load(Ordering::SeqCst) > 0 {
                 self.fail_first_n.fetch_sub(1, Ordering::SeqCst);
                 return Err(Error::Status {
@@ -381,8 +381,8 @@ mod tests {
     fn pick_inbox_errors_when_no_endpoint_present() {
         let actor = json!({ "id": "https://example.com/u/alice", "type": "Person" });
         let actor_url: Url = "https://example.com/u/alice".parse().unwrap();
-        let err = pick_inbox(&actor, &actor_url)
-            .expect_err("actor without inbox must surface an error");
+        let err =
+            pick_inbox(&actor, &actor_url).expect_err("actor without inbox must surface an error");
         assert!(matches!(err, Error::ActorWithoutInbox(_)));
     }
 
@@ -396,11 +396,7 @@ mod tests {
         let mut actors = std::collections::HashMap::new();
         actors.insert(
             alice_url.into(),
-            actor_with_shared_inbox(
-                alice_url,
-                "https://example.com/users/alice/inbox",
-                shared,
-            ),
+            actor_with_shared_inbox(alice_url, "https://example.com/users/alice/inbox", shared),
         );
         actors.insert(
             bob_url.into(),
@@ -417,10 +413,16 @@ mod tests {
 
         let activity = json!({ "id": "https://send.example/a/1", "type": "Create" });
         let n = outbox
-            .dispatch(activity, &[alice_url.parse().unwrap(), bob_url.parse().unwrap()])
+            .dispatch(
+                activity,
+                &[alice_url.parse().unwrap(), bob_url.parse().unwrap()],
+            )
             .await
             .unwrap();
-        assert_eq!(n, 1, "shared inbox dedupes two recipients into one delivery");
+        assert_eq!(
+            n, 1,
+            "shared inbox dedupes two recipients into one delivery"
+        );
 
         // Give the worker a chance to drain.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -494,7 +496,11 @@ mod tests {
         // attempt=0,1,2 produce 3 calls; attempt=3 is the boundary
         // where is_exhausted fires before scheduling, so the call is
         // not made. The worker thus stops after exactly 3 attempts.
-        assert_eq!(calls.len(), 3, "attempts up to but not including max_retries");
+        assert_eq!(
+            calls.len(),
+            3,
+            "attempts up to but not including max_retries"
+        );
     }
 
     #[tokio::test]

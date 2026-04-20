@@ -115,10 +115,7 @@ where
         .with_state(state)
 }
 
-async fn handle<F, H>(
-    State(state): State<InboxState<F, H>>,
-    request: Request,
-) -> impl IntoResponse
+async fn handle<F, H>(State(state): State<InboxState<F, H>>, request: Request) -> impl IntoResponse
 where
     F: Fetcher,
     H: ActivityHandler,
@@ -174,7 +171,9 @@ mod tests {
     use actpub_federation::{
         ActivityHandler, Error, FederationConfig, Fetcher, InboxPipeline, UrlPolicy,
     };
-    use actpub_httpsig::{CavageSigner, SigningKey, content_digest_header_with, sha256_digest_header};
+    use actpub_httpsig::{
+        CavageSigner, SigningKey, content_digest_header_with, sha256_digest_header,
+    };
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use serde_json::{Value, json};
@@ -213,7 +212,11 @@ mod tests {
 
     /// Build a signed inbox POST against the wiremock-style server URI
     /// `recv_uri` plus `path`.
-    fn signed_inbox_post(activity: &Value, recv_uri: &str, path: &str) -> (Request<Body>, actpub_httpsig::VerifyingKey) {
+    fn signed_inbox_post(
+        activity: &Value,
+        recv_uri: &str,
+        path: &str,
+    ) -> (Request<Body>, actpub_httpsig::VerifyingKey) {
         let body = serde_json::to_vec(activity).unwrap();
         let key = SigningKey::generate_ed25519();
         let public = key.verifying_key();
@@ -225,15 +228,15 @@ mod tests {
                 "host",
                 url::Url::parse(&url).unwrap().host_str().unwrap_or(""),
             )
-            .header("date", httpdate::fmt_http_date(std::time::SystemTime::now()))
+            .header(
+                "date",
+                httpdate::fmt_http_date(std::time::SystemTime::now()),
+            )
             .header("content-type", "application/activity+json")
             .header("digest", sha256_digest_header(&body))
             .header(
                 "content-digest",
-                content_digest_header_with(
-                    &body,
-                    &[actpub_httpsig::DigestAlgorithm::Sha256],
-                ),
+                content_digest_header_with(&body, &[actpub_httpsig::DigestAlgorithm::Sha256]),
             )
             .body(body.clone())
             .unwrap();
@@ -258,9 +261,7 @@ mod tests {
         });
         let (req, public) = signed_inbox_post(&activity, "https://recv.example.com", "/inbox");
         let multibase = match &public {
-            actpub_httpsig::VerifyingKey::Ed25519(k) => {
-                actpub_httpsig::Multikey::encode_ed25519(k)
-            }
+            actpub_httpsig::VerifyingKey::Ed25519(k) => actpub_httpsig::Multikey::encode_ed25519(k),
             other => unreachable!("test signs Ed25519, got {other:?}"),
         };
         let actor = json!({
@@ -273,7 +274,8 @@ mod tests {
                 "publicKeyMultibase": multibase,
             }]
         });
-        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
         let app = inbox_router(InboxState::new(pipeline));
 
         let resp = app.oneshot(req).await.unwrap();

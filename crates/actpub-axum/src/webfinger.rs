@@ -34,10 +34,8 @@ pub trait WebFingerResolver: Send + Sync + 'static {
     /// belonging to this server (the router will reply 404).
     /// Return `Err(_)` for unexpected internal failures (the router
     /// will reply 500).
-    fn resolve(
-        &self,
-        resource: String,
-    ) -> impl Future<Output = Result<Option<Jrd>, String>> + Send;
+    fn resolve(&self, resource: String)
+    -> impl Future<Output = Result<Option<Jrd>, String>> + Send;
 }
 
 /// Query parameters accepted at `/.well-known/webfinger`.

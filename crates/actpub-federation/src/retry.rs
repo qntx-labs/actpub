@@ -71,8 +71,8 @@ impl RetryPolicy {
     #[must_use]
     pub const fn mastodon() -> Self {
         Self {
-            initial_delay: Duration::from_secs(300),
-            max_delay: Duration::from_secs(60 * 60 * 60),
+            initial_delay: Duration::from_mins(5),
+            max_delay: Duration::from_hours(60),
             multiplier: 2.0,
             max_retries: 11,
         }
@@ -136,17 +136,17 @@ mod tests {
     #[test]
     fn delay_before_retry_one_equals_initial_delay() {
         let p = RetryPolicy::mastodon();
-        assert_eq!(p.delay_before_retry(1), Duration::from_secs(300));
+        assert_eq!(p.delay_before_retry(1), Duration::from_mins(5));
     }
 
     #[test]
     fn delay_before_retry_grows_exponentially_until_cap() {
         let p = RetryPolicy::mastodon();
         // 5min, 10min, 20min, 40min — pure exponential under the cap.
-        assert_eq!(p.delay_before_retry(1), Duration::from_secs(300));
-        assert_eq!(p.delay_before_retry(2), Duration::from_secs(600));
-        assert_eq!(p.delay_before_retry(3), Duration::from_secs(1200));
-        assert_eq!(p.delay_before_retry(4), Duration::from_secs(2400));
+        assert_eq!(p.delay_before_retry(1), Duration::from_mins(5));
+        assert_eq!(p.delay_before_retry(2), Duration::from_mins(10));
+        assert_eq!(p.delay_before_retry(3), Duration::from_mins(20));
+        assert_eq!(p.delay_before_retry(4), Duration::from_mins(40));
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
         let p = RetryPolicy::mastodon();
         // After enough retries the curve hits the 60h cap and stays
         // there; attempt 50 must be exactly capped, not overflowed.
-        assert_eq!(p.delay_before_retry(50), Duration::from_secs(60 * 60 * 60));
+        assert_eq!(p.delay_before_retry(50), Duration::from_hours(60));
     }
 
     #[test]

@@ -305,7 +305,9 @@ fn pick_verifying_key(actor: &Value, key_id: &str) -> Result<VerifyingKey, Error
     // 1. FEP-521a Multikey (modern Ed25519): match by `id`.
     if let Some(methods) = actor.get("assertionMethod").and_then(Value::as_array) {
         for entry in methods {
-            let Some(obj) = entry.as_object() else { continue };
+            let Some(obj) = entry.as_object() else {
+                continue;
+            };
             let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
             if id != key_id {
                 continue;
@@ -338,7 +340,10 @@ fn pick_verifying_key(actor: &Value, key_id: &str) -> Result<VerifyingKey, Error
     )))
 }
 
-fn rebuild_request(parts: &http::request::Parts, body: Bytes) -> Result<http::Request<Bytes>, Error> {
+fn rebuild_request(
+    parts: &http::request::Parts,
+    body: Bytes,
+) -> Result<http::Request<Bytes>, Error> {
     let mut req = http::Request::new(body);
     *req.method_mut() = parts.method.clone();
     *req.uri_mut() = parts.uri.clone();
@@ -480,12 +485,10 @@ mod tests {
             VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
             other => unreachable!("test signs with Ed25519, got {other:?}"),
         };
-        let actor = actor_json_with_pem(
-            "https://send.example.com/users/alice#key",
-            &multibase,
-            true,
-        );
-        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
         let outcome = pipeline.process(&parts, body).await.unwrap();
         assert!(matches!(outcome, InboxOutcome::Accepted { .. }));
     }
@@ -502,12 +505,10 @@ mod tests {
             VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
             other => unreachable!("test signs with Ed25519, got {other:?}"),
         };
-        let actor = actor_json_with_pem(
-            "https://send.example.com/users/alice#key",
-            &multibase,
-            true,
-        );
-        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
 
         let first = pipeline.process(&parts, body.clone()).await.unwrap();
         assert!(matches!(first, InboxOutcome::Accepted { .. }));
@@ -526,13 +527,11 @@ mod tests {
             VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
             other => unreachable!("test signs with Ed25519, got {other:?}"),
         };
-        let actor = actor_json_with_pem(
-            "https://send.example.com/users/alice#key",
-            &multibase,
-            true,
-        );
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
         // Tamper with the body after signing.
-        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
         let tampered = Bytes::from_static(b"{\"id\":\"x\",\"type\":\"Tampered\"}");
         let err = pipeline
             .process(&parts, tampered)
@@ -555,12 +554,16 @@ mod tests {
             "id": "https://send.example.com/users/alice",
             "type": "Person"
         });
-        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
         let err = pipeline
             .process(&parts, body)
             .await
             .expect_err("missing key must surface");
-        assert!(matches!(err, Error::ActorWithoutKey(_)), "unexpected: {err:?}");
+        assert!(
+            matches!(err, Error::ActorWithoutKey(_)),
+            "unexpected: {err:?}"
+        );
     }
 
     #[test]

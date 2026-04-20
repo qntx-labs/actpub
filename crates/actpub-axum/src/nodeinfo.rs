@@ -81,7 +81,8 @@ impl NodeInfoState {
     }
 
     fn versioned_href(&self, version: Version) -> Result<Url, url::ParseError> {
-        self.base_url.join(&format!("/nodeinfo/{}", version.as_str()))
+        self.base_url
+            .join(&format!("/nodeinfo/{}", version.as_str()))
     }
 }
 
@@ -197,14 +198,16 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         let links = v["links"].as_array().unwrap();
         assert_eq!(links.len(), 2);
-        assert!(links.iter().any(|l| l["href"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("/nodeinfo/2.0")));
-        assert!(links.iter().any(|l| l["href"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("/nodeinfo/2.1")));
+        assert!(
+            links
+                .iter()
+                .any(|l| l["href"].as_str().unwrap_or("").ends_with("/nodeinfo/2.0"))
+        );
+        assert!(
+            links
+                .iter()
+                .any(|l| l["href"].as_str().unwrap_or("").ends_with("/nodeinfo/2.1"))
+        );
     }
 
     #[tokio::test]
