@@ -1,6 +1,6 @@
 //! Asynchronous `WebFinger` client built on [`reqwest`].
 
-use reqwest::{Client, StatusCode, header};
+use reqwest::{Client, header};
 use tracing::debug;
 
 use crate::{Account, Error, Jrd};
@@ -36,11 +36,10 @@ pub async fn resolve(account: &Account, client: &Client) -> Result<Jrd, Error> {
     if !status.is_success() {
         return Err(Error::BadStatus(status.as_u16()));
     }
-    // Tolerate servers that respond with `application/json` instead of the
-    // strictly correct `application/jrd+json` — the Fediverse does this
-    // widely in practice.
-    let _ = StatusCode::OK;
 
+    // The response body is parsed as JSON regardless of Content-Type.
+    // RFC 7033 specifies `application/jrd+json` but Fediverse servers in
+    // the wild very often serve `application/json`; both are accepted.
     let jrd: Jrd = response.json().await?;
 
     if jrd.subject.is_empty() {

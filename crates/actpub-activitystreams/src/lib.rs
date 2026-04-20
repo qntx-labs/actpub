@@ -25,7 +25,7 @@
 //! - Array-typed properties may appear as a single value (handled by
 //!   [`OneOrMany<T>`])
 //! - Object properties may be inlined or appear as plain URL strings (handled
-//!   by [`OrLink<T>`])
+//!   by [`UrlOr<T>`])
 //! - The [`Public`] audience appears in multiple equivalent forms
 //! - Unknown properties are preserved via flattened extension maps
 //!

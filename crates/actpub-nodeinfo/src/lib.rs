@@ -11,10 +11,7 @@
 //! let info = NodeInfo::builder(Version::V2_1, Software::new("my-server", "1.0.0"))
 //!     .protocol(Protocol::ActivityPub)
 //!     .open_registrations(true)
-//!     .usage(Usage {
-//!         users: Some(UserCount { total: Some(42), ..Default::default() }),
-//!         ..Default::default()
-//!     })
+//!     .usage(Usage::new(UserCount::default().with_total(42)))
 //!     .build();
 //!
 //! let json = serde_json::to_string(&info).unwrap();

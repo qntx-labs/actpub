@@ -243,6 +243,75 @@ pub struct Object {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_index: Option<u64>,
 
+    /// Place: accuracy of the position coordinates in percent
+    /// `[0.0, 100.0]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<f64>,
+
+    /// Place: altitude of the position in [`units`](Self::units).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<f64>,
+
+    /// Place: latitude of the position in decimal degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+
+    /// Place: longitude of the position in decimal degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+
+    /// Place: radius of the position in [`units`](Self::units).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+
+    /// Place: measurement units for [`altitude`](Self::altitude) and
+    /// [`radius`](Self::radius). The AS2.0 vocabulary defines a fixed set
+    /// (`"cm"`, `"feet"`, `"inches"`, `"km"`, `"m"`, `"miles"`) but any URI
+    /// is permitted as an extension, so the raw string is preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<String>,
+
+    /// Question: exclusive list of options (only one may be selected).
+    #[serde(default, skip_serializing_if = "OneOrMany::is_empty")]
+    pub one_of: OneOrMany<ObjectRef>,
+
+    /// Question: inclusive list of options (any subset may be selected).
+    #[serde(default, skip_serializing_if = "OneOrMany::is_empty")]
+    pub any_of: OneOrMany<ObjectRef>,
+
+    /// Question: indicates a question has closed. Per AS2.0 this property
+    /// is polymorphic (`xsd:dateTime` | `Object` | `Link` | `xsd:boolean`),
+    /// so the raw JSON value is preserved verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<serde_json::Value>,
+
+    /// Tombstone: the `type` of the object that was deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub former_type: Option<String>,
+
+    /// Tombstone: timestamp of when the object was deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<DateTime<FixedOffset>>,
+
+    /// Relationship: the subject individual in the relationship.
+    ///
+    /// Renamed on the wire to avoid clashing with
+    /// [`attributed_to`](Self::attributed_to); the property name in AS2.0
+    /// is `subject`.
+    #[serde(rename = "subject", default, skip_serializing_if = "Option::is_none")]
+    pub relationship_subject: Option<Box<ObjectRef>>,
+
+    /// Relationship: kind of relationship between
+    /// [`relationship_subject`](Self::relationship_subject) and
+    /// [`object`](Self::object). May be a URI or an inlined `Relationship`
+    /// vocabulary term.
+    #[serde(default, skip_serializing_if = "OneOrMany::is_empty")]
+    pub relationship: OneOrMany<ObjectRef>,
+
+    /// Profile: the object this profile describes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub describes: Option<Box<ObjectRef>>,
+
     /// Unknown or extension properties preserved verbatim.
     ///
     /// This captures any JSON property that does not map to a typed field,
@@ -308,10 +377,19 @@ impl Object {
             || self.is_kind(kind::core::ORDERED_COLLECTION_PAGE)
     }
 
-    /// Returns `true` if the [`to`](Self::to), [`cc`](Self::cc),
-    /// [`bto`](Self::bto), [`bcc`](Self::bcc), or [`audience`](Self::audience)
-    /// properties address the `ActivityPub` `Public` pseudo-actor in any of
-    /// its spellings.
+    /// Returns `true` if any of the **public** audience properties
+    /// address the `ActivityPub` `Public` pseudo-actor in any of its
+    /// spellings.
+    ///
+    /// Per [ActivityPub §5.6][public] only the public-facing addressing
+    /// fields ([`to`](Self::to), [`cc`](Self::cc),
+    /// [`audience`](Self::audience)) participate in the public-visibility
+    /// check. The [`bto`](Self::bto) and [`bcc`](Self::bcc) fields MUST be
+    /// stripped by the server before delivery to remote inboxes, so
+    /// including them here would produce incorrect results on the receiver
+    /// side.
+    ///
+    /// [public]: https://www.w3.org/TR/activitypub/#public-addressing
     #[must_use]
     pub fn is_public(&self) -> bool {
         fn any_public(refs: &OneOrMany<ObjectRef>) -> bool {
@@ -321,11 +399,7 @@ impl Object {
             })
         }
 
-        any_public(&self.to)
-            || any_public(&self.cc)
-            || any_public(&self.bto)
-            || any_public(&self.bcc)
-            || any_public(&self.audience)
+        any_public(&self.to) || any_public(&self.cc) || any_public(&self.audience)
     }
 }
 
@@ -389,6 +463,107 @@ mod tests {
         let public_obj = Object::with_id(Object::new(), Url::parse(Public::URI).unwrap());
         obj2.cc = OneOrMany::one(UrlOr::Object(Box::new(public_obj)));
         assert!(obj2.is_public());
+    }
+
+    #[test]
+    fn is_public_ignores_bto_and_bcc() {
+        // Per ActivityPub §5.6, `bto`/`bcc` MUST be stripped before
+        // delivery, so they must not contribute to public visibility.
+        let mut obj = Object::with_kind("Note");
+        obj.bto = OneOrMany::one(UrlOr::Url(Url::parse(Public::URI).unwrap()));
+        assert!(!obj.is_public(), "bto must not be considered public");
+
+        let mut obj2 = Object::with_kind("Note");
+        obj2.bcc = OneOrMany::one(UrlOr::Url(Url::parse(Public::URI).unwrap()));
+        assert!(!obj2.is_public(), "bcc must not be considered public");
+    }
+
+    #[test]
+    fn place_properties_roundtrip() {
+        let raw = json!({
+            "type": "Place",
+            "name": "Work Office",
+            "latitude": 36.75,
+            "longitude": 119.7726,
+            "altitude": 90.0,
+            "accuracy": 94.5,
+            "radius": 10.5,
+            "units": "m"
+        });
+        let obj: Object = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(obj.latitude, Some(36.75));
+        assert_eq!(obj.longitude, Some(119.7726));
+        assert_eq!(obj.altitude, Some(90.0));
+        assert_eq!(obj.accuracy, Some(94.5));
+        assert_eq!(obj.radius, Some(10.5));
+        assert_eq!(obj.units.as_deref(), Some("m"));
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn question_properties_roundtrip() {
+        let raw = json!({
+            "type": "Question",
+            "name": "What is your favourite colour?",
+            "oneOf": [
+                { "type": "Note", "name": "Red" },
+                { "type": "Note", "name": "Blue" }
+            ],
+            "closed": "2026-01-01T00:00:00Z"
+        });
+        let obj: Object = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(obj.one_of.len(), 2);
+        assert!(obj.closed.is_some());
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn tombstone_properties_roundtrip() {
+        let raw = json!({
+            "id": "https://mastodon.social/users/alice/statuses/1",
+            "type": "Tombstone",
+            "formerType": "Note",
+            "deleted": "2026-04-20T12:00:00Z"
+        });
+        let obj: Object = serde_json::from_value(raw.clone()).unwrap();
+        assert!(obj.is_kind("Tombstone"));
+        assert_eq!(obj.former_type.as_deref(), Some("Note"));
+        assert!(obj.deleted.is_some());
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn relationship_properties_roundtrip() {
+        let raw = json!({
+            "type": "Relationship",
+            "subject": "https://example.com/users/alice",
+            "relationship": "http://purl.org/vocab/relationship/acquaintanceOf",
+            "object": "https://example.com/users/bob"
+        });
+        let obj: Object = serde_json::from_value(raw.clone()).unwrap();
+        assert!(obj.relationship_subject.is_some());
+        assert_eq!(obj.relationship.len(), 1);
+        assert_eq!(obj.object.len(), 1);
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn profile_describes_roundtrip() {
+        let raw = json!({
+            "type": "Profile",
+            "describes": {
+                "type": "Person",
+                "name": "Alice"
+            }
+        });
+        let obj: Object = serde_json::from_value(raw.clone()).unwrap();
+        assert!(obj.describes.is_some());
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back, raw);
     }
 
     #[test]

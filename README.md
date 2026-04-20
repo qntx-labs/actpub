@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD033 MD041 MD036 -->
 
-# Actpub
+# ActPub
 
 Rust library for ActivityPub protocol.
 

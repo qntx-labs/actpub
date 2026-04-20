@@ -16,6 +16,7 @@ use crate::rels;
 /// [`properties`](Self::properties) drawn from arbitrary URI schemes, and
 /// a list of [`links`](Self::links) to related resources.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Jrd {
     /// The URI of the resource described by this JRD.
     pub subject: String,
@@ -115,7 +116,15 @@ impl JrdBuilder {
 }
 
 /// A link entry inside a [`Jrd`].
+///
+/// Per [RFC 7033 §4.4.4][rel], the `href` and `template` members are
+/// mutually exclusive: only one MUST be present in a given link. This
+/// invariant is checked at runtime by [`JrdLink::validate`] and asserted
+/// by [`JrdLinkBuilder`] in debug builds.
+///
+/// [rel]: https://datatracker.ietf.org/doc/html/rfc7033#section-4.4.4
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JrdLink {
     /// Link relation (IANA registered name or URI).
     pub rel: String,
@@ -151,6 +160,21 @@ impl JrdLink {
             },
         }
     }
+
+    /// Checks that this link satisfies the RFC 7033 §4.4.4 invariants.
+    ///
+    /// Currently enforces mutual exclusion between [`href`](Self::href)
+    /// and [`template`](Self::template).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if both `href` and `template` are set.
+    pub const fn validate(&self) -> Result<(), &'static str> {
+        if self.href.is_some() && self.template.is_some() {
+            return Err("JRD link must not have both `href` and `template`");
+        }
+        Ok(())
+    }
 }
 
 /// Builder for [`JrdLink`] produced by [`JrdLink::builder`].
@@ -167,10 +191,14 @@ impl JrdLinkBuilder {
         self
     }
 
-    /// Sets the `href` URL.
+    /// Sets the `href` URL, clearing any previously-set `template`.
+    ///
+    /// Per RFC 7033 §4.4.4, the two fields are mutually exclusive, so
+    /// this setter atomically clears the other.
     #[must_use]
     pub fn href(mut self, href: Url) -> Self {
         self.inner.href = Some(href);
+        self.inner.template = None;
         self
     }
 
@@ -188,10 +216,14 @@ impl JrdLinkBuilder {
         self
     }
 
-    /// Sets the URI template.
+    /// Sets the URI template, clearing any previously-set `href`.
+    ///
+    /// Per RFC 7033 §4.4.4, the two fields are mutually exclusive, so
+    /// this setter atomically clears the other.
     #[must_use]
     pub fn template(mut self, template: impl Into<String>) -> Self {
         self.inner.template = Some(template.into());
+        self.inner.href = None;
         self
     }
 

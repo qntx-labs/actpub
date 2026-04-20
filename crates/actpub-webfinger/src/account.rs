@@ -108,10 +108,24 @@ impl Account {
     ///
     /// Returns [`Error::InvalidUrl`] if the host is not a valid authority.
     pub fn webfinger_url(&self) -> Result<Url, Error> {
+        self.webfinger_url_with_scheme("https")
+    }
+
+    /// Builds the `{scheme}://{host}/.well-known/webfinger?resource=…` URL
+    /// for this account, allowing the caller to override the scheme.
+    ///
+    /// Production code should always use [`Self::webfinger_url`] to ensure
+    /// `https`. The override exists to support test fixtures, local
+    /// development, and Tor hidden-service endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidUrl`] if the resulting URL is malformed.
+    pub fn webfinger_url_with_scheme(&self, scheme: &str) -> Result<Url, Error> {
         let resource = self.to_resource();
         let encoded = percent_encode(&resource);
         let raw = format!(
-            "https://{host}{path}?resource={encoded}",
+            "{scheme}://{host}{path}?resource={encoded}",
             host = self.host,
             path = crate::WELL_KNOWN_PATH,
         );

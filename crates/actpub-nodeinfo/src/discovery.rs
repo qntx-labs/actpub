@@ -17,6 +17,7 @@ pub const SCHEMA_REL_PREFIX: &str = "http://nodeinfo.diaspora.software/ns/schema
 /// least one link should be present; clients typically pick the most
 /// recent version they support.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Discovery {
     /// Links to specific schema documents.
     pub links: Vec<DiscoveryLink>,
@@ -69,6 +70,7 @@ impl Discovery {
 
 /// A single discovery link pointing at a specific schema version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DiscoveryLink {
     /// Schema relation URI (e.g. `http://nodeinfo.diaspora.software/ns/schema/2.1`).
     pub rel: String,
@@ -142,10 +144,10 @@ mod tests {
 
     #[test]
     fn discovery_link_version_is_none_for_unknown() {
-        let link = DiscoveryLink {
-            rel: "http://example.com/schema/99".to_owned(),
-            href: "https://example.com/ni/99".parse().unwrap(),
-        };
-        assert_eq!(link.version(), None);
+        let link = DiscoveryLink::new(Version::V2_0, "https://example.com/ni/99".parse().unwrap());
+        // Tamper with the rel to simulate an unknown schema URI.
+        let mut unknown = link;
+        unknown.rel = "http://example.com/schema/99".to_owned();
+        assert_eq!(unknown.version(), None);
     }
 }

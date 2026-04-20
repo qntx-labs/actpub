@@ -1,15 +1,17 @@
 //! `NodeInfo` schema types (2.0 / 2.1).
 //!
 //! See [http://nodeinfo.diaspora.software/](http://nodeinfo.diaspora.software/)
-//! for the canonical JSON Schemas.
-
-use std::collections::BTreeMap;
+//! for the canonical JSON Schemas. All enum values are drawn directly from
+//! the published schemas; unknown values round-trip losslessly through the
+//! `Other(String)` variants so the crate can interoperate with forward-
+//! compatible servers and third-party extensions.
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// The `NodeInfo` schema version this document conforms to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Version {
     /// `NodeInfo` 2.0 — [schema](http://nodeinfo.diaspora.software/ns/schema/2.0).
     #[serde(rename = "2.0")]
@@ -43,18 +45,24 @@ impl Version {
 
 /// A federation protocol supported by a NodeInfo-described server.
 ///
-/// The strings here are drawn from the `NodeInfo` 2.1 enum; unknown values
-/// round-trip through [`Self::Other`].
+/// The ten named variants are the exact `protocols` enumeration of the
+/// [NodeInfo 2.1 schema][schema]; unknown values (including community
+/// extensions such as `matrix` or `bluesky` used by bridges) round-trip
+/// losslessly through [`Self::Other`].
+///
+/// [schema]: http://nodeinfo.diaspora.software/ns/schema/2.1
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Protocol {
     /// The W3C `ActivityPub` protocol.
     ActivityPub,
+    /// Buddycloud federation.
+    Buddycloud,
+    /// Distributed Friendika Network.
+    Dfrn,
     /// Diaspora.
     Diaspora,
-    /// `GNUSocial`.
-    GnuSocial,
     /// Libertree.
     Libertree,
     /// `OStatus` (legacy).
@@ -67,14 +75,21 @@ pub enum Protocol {
     Xmpp,
     /// Zot.
     Zot,
-    /// Matrix.
-    Matrix,
     /// An unrecognised protocol identifier, preserved verbatim.
+    ///
+    /// Common non-schema values seen in the wild include `matrix`,
+    /// `bluesky`, `gnusocial`, and `nostr`. All are preserved through this
+    /// fallback variant.
     #[serde(untagged)]
     Other(String),
 }
 
 /// An inbound bridge service defined in `NodeInfo`.
+///
+/// Enumeration matches the `inbound` values from the `services` definition
+/// in the [NodeInfo 2.1 schema][schema].
+///
+/// [schema]: http://nodeinfo.diaspora.software/ns/schema/2.1
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -97,12 +112,17 @@ pub enum InboundService {
     Rss2_0,
     /// Twitter.
     Twitter,
-    /// Unknown service identifier.
+    /// An unrecognised service identifier, preserved verbatim.
     #[serde(untagged)]
     Other(String),
 }
 
 /// An outbound bridge service defined in `NodeInfo`.
+///
+/// Enumeration matches the `outbound` values from the `services` definition
+/// in the [NodeInfo 2.1 schema][schema].
+///
+/// [schema]: http://nodeinfo.diaspora.software/ns/schema/2.1
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -130,14 +150,14 @@ pub enum OutboundService {
     Google,
     /// `InsaneJournal`.
     InsaneJournal,
-    /// `LiveJournal`.
-    LiveJournal,
-    /// `LibertyHub`.
+    /// Libertree.
     Libertree,
     /// `LinkedIn`.
     LinkedIn,
-    /// Lotus.
-    LotusNotes,
+    /// `LiveJournal`.
+    LiveJournal,
+    /// `MediaGoblin`.
+    MediaGoblin,
     /// `MySpace`.
     MySpace,
     /// Pinterest.
@@ -171,36 +191,49 @@ pub enum OutboundService {
 }
 
 /// Set of inbound/outbound bridge services.
+///
+/// Per the `NodeInfo` schema, both `inbound` and `outbound` are required
+/// arrays (they may be empty).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Services {
     /// Inbound services.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub inbound: Vec<InboundService>,
 
     /// Outbound services.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub outbound: Vec<OutboundService>,
+}
+
+impl Services {
+    /// Constructs a [`Services`] block.
+    #[must_use]
+    pub const fn new(inbound: Vec<InboundService>, outbound: Vec<OutboundService>) -> Self {
+        Self { inbound, outbound }
+    }
 }
 
 /// Metadata about the software powering a server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Software {
     /// Canonical software name (e.g. `mastodon`, `lemmy`, `mitra`).
     ///
-    /// Per `NodeInfo` 2.0/2.1 schemas the name must match a strict regex,
-    /// but this crate preserves the raw string to interoperate with the
-    /// relaxed FEP-0151 profile.
+    /// Per `NodeInfo` 2.0/2.1 schemas the name must match a strict regex
+    /// (`^[a-z0-9-]+$`), but this crate preserves the raw string to
+    /// interoperate with the relaxed FEP-0151 profile.
     pub name: String,
 
-    /// Version string. Required, but may be an empty string.
+    /// Version string.
     pub version: String,
 
     /// Repository URL (`NodeInfo` 2.1 only).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<Url>,
 
     /// Homepage URL (`NodeInfo` 2.1 only).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<Url>,
 }
 
@@ -214,46 +247,137 @@ impl Software {
             homepage: None,
         }
     }
+
+    /// Sets the repository URL and returns `self` for chaining.
+    #[must_use]
+    pub fn with_repository(mut self, repository: Url) -> Self {
+        self.repository = Some(repository);
+        self
+    }
+
+    /// Sets the homepage URL and returns `self` for chaining.
+    #[must_use]
+    pub fn with_homepage(mut self, homepage: Url) -> Self {
+        self.homepage = Some(homepage);
+        self
+    }
 }
 
 /// Per-user activity counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UserCount {
     /// Total registered users.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
 
     /// Users active in the last 180 days.
-    #[serde(rename = "activeHalfyear", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "activeHalfyear",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_halfyear: Option<u64>,
 
     /// Users active in the last 30 days.
-    #[serde(rename = "activeMonth", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "activeMonth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_month: Option<u64>,
 }
 
+impl UserCount {
+    /// Constructs a [`UserCount`] from its components.
+    #[must_use]
+    pub const fn new(
+        total: Option<u64>,
+        active_halfyear: Option<u64>,
+        active_month: Option<u64>,
+    ) -> Self {
+        Self {
+            total,
+            active_halfyear,
+            active_month,
+        }
+    }
+
+    /// Sets the total registered-user count and returns `self`.
+    #[must_use]
+    pub const fn with_total(mut self, total: u64) -> Self {
+        self.total = Some(total);
+        self
+    }
+}
+
 /// Aggregate server usage statistics.
+///
+/// Per the `NodeInfo` schema the `users` field is required; the other fields
+/// are optional but conventionally reported by large instances.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Usage {
-    /// Per-user counts.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub users: Option<UserCount>,
+    /// Per-user counts (required field; may contain all `None` values if
+    /// the server chooses not to disclose them).
+    #[serde(default)]
+    pub users: UserCount,
 
     /// Total number of posts authored by local users.
-    #[serde(rename = "localPosts", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "localPosts",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub local_posts: Option<u64>,
 
     /// Total number of comments authored by local users.
-    #[serde(rename = "localComments", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "localComments",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub local_comments: Option<u64>,
+}
+
+impl Usage {
+    /// Constructs a [`Usage`] with only the required `users` field set.
+    #[must_use]
+    pub const fn new(users: UserCount) -> Self {
+        Self {
+            users,
+            local_posts: None,
+            local_comments: None,
+        }
+    }
+
+    /// Sets the total number of posts authored by local users.
+    #[must_use]
+    pub const fn with_local_posts(mut self, posts: u64) -> Self {
+        self.local_posts = Some(posts);
+        self
+    }
+
+    /// Sets the total number of comments authored by local users.
+    #[must_use]
+    pub const fn with_local_comments(mut self, comments: u64) -> Self {
+        self.local_comments = Some(comments);
+        self
+    }
 }
 
 /// A `NodeInfo` 2.0 / 2.1 document.
 ///
-/// Unified container for both versions — fields that exist only in 2.1
-/// (e.g. [`Software::repository`]) are `Option`-typed and omitted on the
-/// wire when unset, keeping the document conformant under both schemas.
+/// All seven top-level fields required by the `NodeInfo` 2.1 schema are
+/// always present on the wire — empty arrays and empty `metadata` objects
+/// are emitted rather than omitted, to keep the document strictly
+/// conformant under both 2.0 and 2.1.
+///
+/// Fields that are specific to 2.1 (e.g. [`Software::repository`]) remain
+/// `Option`-typed and are omitted when unset, so a document built with
+/// [`Version::V2_0`] still validates under the 2.0 schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct NodeInfo {
     /// Schema version this document conforms to.
     pub version: Version,
@@ -262,11 +386,11 @@ pub struct NodeInfo {
     pub software: Software,
 
     /// Federation protocols implemented by this server.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub protocols: Vec<Protocol>,
 
-    /// Bridge services, if any.
-    #[serde(default, skip_serializing_if = "skip_empty_services")]
+    /// Bridge services (always emitted, even when both arrays are empty).
+    #[serde(default)]
     pub services: Services,
 
     /// Whether the server accepts new registrations.
@@ -277,13 +401,14 @@ pub struct NodeInfo {
     #[serde(default)]
     pub usage: Usage,
 
-    /// Arbitrary software-specific metadata.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    /// Arbitrary software-specific metadata (always emitted, defaulting to
+    /// an empty object per the schema).
+    #[serde(default = "default_metadata")]
     pub metadata: serde_json::Value,
 }
 
-const fn skip_empty_services(s: &Services) -> bool {
-    s.inbound.is_empty() && s.outbound.is_empty()
+fn default_metadata() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 impl NodeInfo {
@@ -298,7 +423,7 @@ impl NodeInfo {
                 services: Services::default(),
                 open_registrations: false,
                 usage: Usage::default(),
-                metadata: serde_json::Value::Null,
+                metadata: default_metadata(),
             },
         }
     }
@@ -354,8 +479,7 @@ impl NodeInfoBuilder {
     }
 
     /// Attaches a single typed metadata entry, producing an object on the
-    /// wire. Useful when the caller wants to emit a `metadata` object with
-    /// named keys.
+    /// wire.
     #[must_use]
     pub fn metadata_entry(
         mut self,
@@ -376,22 +500,6 @@ impl NodeInfoBuilder {
     pub fn build(self) -> NodeInfo {
         self.inner
     }
-}
-
-// Hook so that `#[serde(default)]` on `metadata` accepts `null`.
-#[allow(dead_code, reason = "used by serde via type defaults")]
-const fn metadata_default() -> serde_json::Value {
-    serde_json::Value::Null
-}
-
-/// Compact helper for inserting multiple metadata entries.
-#[must_use]
-pub(crate) fn metadata_from<I>(iter: I) -> serde_json::Value
-where
-    I: IntoIterator<Item = (String, serde_json::Value)>,
-{
-    let map: BTreeMap<String, serde_json::Value> = iter.into_iter().collect();
-    serde_json::to_value(map).unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(test)]
@@ -430,7 +538,36 @@ mod tests {
     }
 
     #[test]
-    fn mastodon_style_nodeinfo_roundtrips() {
+    fn all_schema_protocols_roundtrip() {
+        for (canonical, expected) in [
+            ("activitypub", Protocol::ActivityPub),
+            ("buddycloud", Protocol::Buddycloud),
+            ("dfrn", Protocol::Dfrn),
+            ("diaspora", Protocol::Diaspora),
+            ("libertree", Protocol::Libertree),
+            ("ostatus", Protocol::OStatus),
+            ("pumpio", Protocol::PumpIo),
+            ("tent", Protocol::Tent),
+            ("xmpp", Protocol::Xmpp),
+            ("zot", Protocol::Zot),
+        ] {
+            let p: Protocol = serde_json::from_value(json!(canonical)).unwrap();
+            assert_eq!(p, expected, "{canonical} should parse to {expected:?}");
+            let back = serde_json::to_value(&p).unwrap();
+            assert_eq!(back, json!(canonical));
+        }
+    }
+
+    #[test]
+    fn outbound_service_mediagoblin_roundtrips() {
+        let s: OutboundService = serde_json::from_value(json!("mediagoblin")).unwrap();
+        assert_eq!(s, OutboundService::MediaGoblin);
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back, json!("mediagoblin"));
+    }
+
+    #[test]
+    fn mastodon_style_nodeinfo_roundtrips_verbatim() {
         let raw = json!({
             "version": "2.1",
             "software": {
@@ -457,21 +594,19 @@ mod tests {
             "metadata": {}
         });
 
-        let info: NodeInfo = serde_json::from_value(raw).unwrap();
+        let info: NodeInfo = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(info.version, Version::V2_1);
         assert_eq!(info.software.name, "mastodon");
         assert_eq!(info.protocols, vec![Protocol::ActivityPub]);
-        assert_eq!(info.usage.users.unwrap().total, Some(1234));
+        assert_eq!(info.usage.users.total, Some(1234));
         assert!(info.open_registrations);
 
         let back = serde_json::to_value(&info).unwrap();
-        // `services` with two empty arrays should round-trip through the skip logic.
-        assert_eq!(back["software"]["name"], "mastodon");
-        assert_eq!(back["protocols"], json!(["activitypub"]));
+        assert_eq!(back, raw, "roundtrip must preserve verbatim JSON");
     }
 
     #[test]
-    fn builder_produces_minimal_valid_document() {
+    fn builder_always_emits_required_fields() {
         let info = NodeInfo::builder(Version::V2_0, Software::new("test-server", "0.1.0"))
             .protocol(Protocol::ActivityPub)
             .open_registrations(false)
@@ -479,8 +614,12 @@ mod tests {
 
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["version"], json!("2.0"));
+        assert_eq!(v["protocols"], json!(["activitypub"]));
+        assert_eq!(v["services"], json!({"inbound": [], "outbound": []}));
         assert_eq!(v["openRegistrations"], json!(false));
-        assert!(v.get("services").is_none());
+        assert_eq!(v["metadata"], json!({}));
+        // `usage.users` must be present even when empty
+        assert!(v["usage"].get("users").is_some());
     }
 
     #[test]
@@ -490,5 +629,19 @@ mod tests {
             .build();
 
         assert_eq!(info.metadata["supports_feps"], json!(["521a", "8b32"]));
+    }
+
+    #[test]
+    fn software_builder_sets_optional_fields() {
+        let sw = Software::new("mastodon", "4.5.0")
+            .with_repository("https://github.com/mastodon/mastodon".parse().unwrap())
+            .with_homepage("https://joinmastodon.org/".parse().unwrap());
+
+        let v = serde_json::to_value(&sw).unwrap();
+        assert_eq!(
+            v["repository"],
+            json!("https://github.com/mastodon/mastodon")
+        );
+        assert_eq!(v["homepage"], json!("https://joinmastodon.org/"));
     }
 }
