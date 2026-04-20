@@ -1,8 +1,8 @@
-//! Core ActivityPub protocol layer.
+//! Core `ActivityPub` protocol layer.
 //!
 //! Defines the three fundamental traits that drive federation:
 //!
-//! - [`Object`] — anything addressable by an ActivityPub `id` URI, with
+//! - [`Object`] — anything addressable by an `ActivityPub` `id` URI, with
 //!   database <-> wire conversion
 //! - [`Actor`] — an `Object` that owns cryptographic keys and mailboxes
 //! - [`Activity`] — a verb applied to an object, with verification and

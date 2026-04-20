@@ -1,6 +1,6 @@
-//! NodeInfo server metadata protocol for the Fediverse.
+//! `NodeInfo` server metadata protocol for the Fediverse.
 //!
-//! Implements NodeInfo [2.0] / [2.1] and [FEP-0151] (NodeInfo 2025 edition),
+//! Implements `NodeInfo` [2.0] / [2.1] and [FEP-0151] (`NodeInfo` 2025 edition),
 //! providing both discovery (`/.well-known/nodeinfo`) and schema documents.
 //!
 //! [2.0]: http://nodeinfo.diaspora.software/ns/schema/2.0

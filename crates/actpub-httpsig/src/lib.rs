@@ -1,4 +1,4 @@
-//! Dual-stack HTTP message signatures for ActivityPub.
+//! Dual-stack HTTP message signatures for `ActivityPub`.
 //!
 //! Provides signing and verification for both:
 //!

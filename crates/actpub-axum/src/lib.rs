@@ -1,7 +1,7 @@
 //! [axum] integration for `actpub-federation`.
 //!
 //! Provides extractors, responders and router helpers that let applications
-//! drop ActivityPub federation into an existing axum 0.8 service:
+//! drop `ActivityPub` federation into an existing axum 0.8 service:
 //!
 //! - `ActivityData` extractor — verifies HTTP signature + Digest, hands the
 //!   raw JSON body to your activity dispatcher
