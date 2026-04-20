@@ -241,13 +241,14 @@ fn compute_hash_data(proof_config: &Value, transformed: &Value) -> Result<[u8; 6
 }
 
 fn check_proof_header(proof: &Value) -> Result<(), Error> {
-    let type_ = proof
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::InvalidProofField {
-            field: "type",
-            reason: "missing or non-string".to_owned(),
-        })?;
+    let type_ =
+        proof
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidProofField {
+                field: "type",
+                reason: "missing or non-string".to_owned(),
+            })?;
     if type_ != PROOF_TYPE {
         return Err(Error::UnsupportedProofType(type_.to_owned()));
     }

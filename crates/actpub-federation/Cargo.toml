@@ -24,15 +24,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 reqwest = { workspace = true, features = ["json", "stream"] }
-reqwest-middleware = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
-tokio-util = { workspace = true, features = ["time"] }
 futures = { workspace = true }
-itertools = { workspace = true }
 httpdate = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 bon = { workspace = true }
-pin-project-lite = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

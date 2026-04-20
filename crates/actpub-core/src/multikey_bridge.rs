@@ -33,11 +33,7 @@ use crate::error::Error;
 ///
 /// [`Multikey`]: actpub_activitystreams::Multikey
 #[must_use]
-pub fn publish_ed25519(
-    public_key: &Ed25519PublicKey,
-    key_id: Url,
-    controller: Url,
-) -> AsMultikey {
+pub fn publish_ed25519(public_key: &Ed25519PublicKey, key_id: Url, controller: Url) -> AsMultikey {
     let encoded = HsMultikey::encode_ed25519(public_key);
     AsMultikey::new(key_id, controller, encoded)
 }
