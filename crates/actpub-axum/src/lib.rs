@@ -12,3 +12,10 @@
 //!
 //! [axum]: https://docs.rs/axum
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(
+    unused_crate_dependencies,
+    dead_code,
+    unused_imports,
+    missing_docs,
+    reason = "crate is a scaffold; dependencies are declared up-front so that implementation work in later phases does not churn the manifest. Remove this allow once the crate has concrete items."
+)]
