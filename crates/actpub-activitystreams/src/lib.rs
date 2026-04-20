@@ -45,18 +45,24 @@
     )
 )]
 
+mod actor;
 mod context;
 mod error;
 mod link;
+mod multikey;
 mod object;
+mod proof;
 mod value;
 
 pub mod kind;
 
+pub use self::actor::{Endpoints, PublicKey};
 pub use self::context::{Context, ContextEntry, WithContext};
 pub use self::error::Error;
 pub use self::link::Link;
+pub use self::multikey::{AssertionMethod, Multikey};
 pub use self::object::{LanguageMap, Object, ObjectRef};
+pub use self::proof::Proof;
 pub use self::value::{HasId, OneOrMany, Public, UrlOr};
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].

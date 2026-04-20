@@ -20,7 +20,10 @@ use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::actor::{Endpoints, PublicKey};
 use crate::kind;
+use crate::multikey::AssertionMethod;
+use crate::proof::Proof;
 use crate::value::{HasId, OneOrMany, Public, UrlOr};
 
 /// A reference-valued property that may appear as a bare URL or as an
@@ -315,6 +318,93 @@ pub struct Object {
     /// Profile: the object this profile describes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub describes: Option<Box<ObjectRef>>,
+
+    /// `ActivityPub` §4.1: short, mention-friendly handle (e.g. `"alice"`).
+    /// Mandatory on every Mastodon-style actor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+
+    /// `ActivityPub` §4.1: actor's inbox URL. Servers POST activities here
+    /// to deliver them to this actor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<Url>,
+
+    /// `ActivityPub` §4.1: actor's outbox URL containing the
+    /// `OrderedCollection` of activities they have authored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<Url>,
+
+    /// `ActivityPub` §4.1: collection of actors following this actor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followers: Option<Url>,
+
+    /// `ActivityPub` §4.1: collection of actors this actor follows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub following: Option<Url>,
+
+    /// `ActivityPub` §4.1: collection of objects this actor has liked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liked: Option<Url>,
+
+    /// `ActivityPub` §4.1: list of additional collections owned by this
+    /// actor (e.g. groups, lists). Rarely used in practice but defined
+    /// in the spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<Url>,
+
+    /// W3C Security v1 / ActivityPub-via-Mastodon: legacy Cavage-style
+    /// HTTP-Signature verification key. See [`PublicKey`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<PublicKey>,
+
+    /// `ActivityPub` §4.1 `endpoints` block (shared inbox, OAuth
+    /// endpoints, …). See [`Endpoints`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Endpoints>,
+
+    /// Mastodon `toot:featured` collection of pinned posts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub featured: Option<Url>,
+
+    /// Mastodon `toot:featuredTags` collection of pinned hashtags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub featured_tags: Option<Url>,
+
+    /// AS 2.0: whether the actor's follow requests require manual
+    /// approval (i.e. private profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manually_approves_followers: Option<bool>,
+
+    /// Mastodon `toot:discoverable`: whether the actor opts in to
+    /// inclusion in directory listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discoverable: Option<bool>,
+
+    /// Mastodon `toot:indexable`: whether posts may be indexed by
+    /// full-text search engines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexable: Option<bool>,
+
+    /// Mastodon `toot:memorial`: whether this account has been
+    /// memorialised (read-only after death).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memorial: Option<bool>,
+
+    /// FEP-521a `assertionMethod` array of verification methods used
+    /// for content-signing (FEP-8b32 proofs and similar).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_method: Vec<AssertionMethod>,
+
+    /// W3C Controlled Identifiers `authentication` array of
+    /// verification methods used for proving control of the actor URL
+    /// (challenge-response auth, signed delete tombstones, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authentication: Vec<AssertionMethod>,
+
+    /// FEP-8b32: zero or more Object Integrity Proofs attached to this
+    /// document. Multiple entries form a proof chain.
+    #[serde(default, skip_serializing_if = "OneOrMany::is_empty")]
+    pub proof: OneOrMany<Proof>,
 
     /// Unknown or extension properties preserved verbatim.
     ///
