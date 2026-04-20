@@ -522,23 +522,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_roundtrips_known() {
-        let p: Protocol = serde_json::from_value(json!("activitypub")).unwrap();
-        assert_eq!(p, Protocol::ActivityPub);
-        let back = serde_json::to_value(&p).unwrap();
-        assert_eq!(back, json!("activitypub"));
-    }
-
-    #[test]
-    fn protocol_preserves_unknown() {
-        let p: Protocol = serde_json::from_value(json!("bluesky")).unwrap();
-        assert_eq!(p, Protocol::Other("bluesky".to_owned()));
-        let back = serde_json::to_value(&p).unwrap();
-        assert_eq!(back, json!("bluesky"));
-    }
-
-    #[test]
-    fn all_schema_protocols_roundtrip() {
+    fn every_schema_protocol_roundtrips() {
+        // Covers the exact 10-value `protocols` enumeration of the
+        // NodeInfo 2.1 schema. A regression here means either a schema
+        // drift (an enum variant was renamed/removed) or a serde rename
+        // typo on our side.
         for (canonical, expected) in [
             ("activitypub", Protocol::ActivityPub),
             ("buddycloud", Protocol::Buddycloud),
@@ -551,11 +539,33 @@ mod tests {
             ("xmpp", Protocol::Xmpp),
             ("zot", Protocol::Zot),
         ] {
-            let p: Protocol = serde_json::from_value(json!(canonical)).unwrap();
-            assert_eq!(p, expected, "{canonical} should parse to {expected:?}");
-            let back = serde_json::to_value(&p).unwrap();
-            assert_eq!(back, json!(canonical));
+            let p: Protocol =
+                serde_json::from_value(json!(canonical)).expect("known value must deserialise");
+            assert_eq!(
+                p, expected,
+                "{canonical} should deserialise to {expected:?}"
+            );
+
+            let back = serde_json::to_value(&p).expect("known value must serialise");
+            assert_eq!(
+                back,
+                json!(canonical),
+                "{expected:?} should serialise back to {canonical}",
+            );
         }
+    }
+
+    #[test]
+    fn protocol_preserves_unknown_variant() {
+        // Matrix, Bluesky, Nostr and similar community extensions are not
+        // part of the NodeInfo schema but appear in production documents;
+        // they must be preserved verbatim through `Other(String)`.
+        let p: Protocol =
+            serde_json::from_value(json!("bluesky")).expect("unknown value must deserialise");
+        assert_eq!(p, Protocol::Other("bluesky".to_owned()));
+
+        let back = serde_json::to_value(&p).expect("Other variant must serialise");
+        assert_eq!(back, json!("bluesky"));
     }
 
     #[test]

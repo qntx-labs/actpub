@@ -314,13 +314,93 @@ mod tests {
 
     #[test]
     fn property_with_null_value_roundtrips() {
+        // RFC 7033 §4.4.3 permits JSON `null` as a property value to
+        // indicate "known-absent" (as opposed to "unknown"), and this
+        // distinction must survive a roundtrip.
         let raw = json!({
             "subject": "acct:alice@example.com",
             "properties": { "http://example/schema/foo": null }
         });
-        let jrd: Jrd = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(jrd.properties.get("http://example/schema/foo"), Some(&None));
-        let back = serde_json::to_value(&jrd).unwrap();
+        let jrd: Jrd = serde_json::from_value(raw.clone()).expect("deserialise");
+        assert_eq!(
+            jrd.properties.get("http://example/schema/foo"),
+            Some(&None),
+            "null property must deserialise to Some(None), not None",
+        );
+        let back = serde_json::to_value(&jrd).expect("serialise");
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn jrd_link_validate_accepts_href_only() {
+        let link = JrdLink::builder(rels::ACTIVITYPUB_ACTOR)
+            .href("https://example.com/a".parse().expect("valid URL"))
+            .build();
+        assert!(link.validate().is_ok());
+    }
+
+    #[test]
+    fn jrd_link_validate_accepts_template_only() {
+        let link = JrdLink::builder(rels::OSTATUS_SUBSCRIBE)
+            .template("https://example.com/subscribe?uri={uri}")
+            .build();
+        assert!(link.validate().is_ok());
+    }
+
+    #[test]
+    fn jrd_link_validate_rejects_both_href_and_template() {
+        // Construct an invalid link directly (the builder cannot produce
+        // this state) to verify the validator catches it.
+        let mut link = JrdLink::builder(rels::SELF).build();
+        link.href = Some("https://example.com/a".parse().expect("valid URL"));
+        link.template = Some("https://example.com/t?u={u}".to_owned());
+        assert!(
+            link.validate().is_err(),
+            "RFC 7033 §4.4.4 forbids both `href` and `template` on a single link",
+        );
+    }
+
+    #[test]
+    fn jrd_link_builder_href_after_template_clears_template() {
+        // The builder's exclusivity guarantee: setting `href` after
+        // `template` must drop the template to maintain the RFC 7033
+        // invariant; this keeps the resulting link valid by construction.
+        let link = JrdLink::builder(rels::SELF)
+            .template("https://example.com/t?u={u}")
+            .href("https://example.com/a".parse().expect("valid URL"))
+            .build();
+        assert!(link.template.is_none(), "template must be cleared");
+        assert!(link.href.is_some(), "href must be retained");
+        assert!(link.validate().is_ok());
+    }
+
+    #[test]
+    fn activitypub_actor_falls_back_to_ld_json_profile() {
+        // Some implementations (notably Lemmy older versions) emit the
+        // actor link using the full JSON-LD media type instead of the
+        // shorthand. The helper must find it either way.
+        let jrd: Jrd = serde_json::from_value(json!({
+            "subject": "acct:alice@example.com",
+            "links": [{
+                "rel": "self",
+                "type": "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+                "href": "https://example.com/users/alice"
+            }]
+        }))
+        .expect("JSON-LD profile JRD must parse");
+
+        let actor = jrd
+            .activitypub_actor()
+            .expect("should fall back to ld+json profile");
+        assert_eq!(
+            actor.href.as_ref().map(Url::as_str),
+            Some("https://example.com/users/alice"),
+        );
+    }
+
+    #[test]
+    fn find_link_returns_none_for_missing_rel() {
+        let jrd = Jrd::builder("acct:alice@example.com").build();
+        assert!(jrd.find_link("http://example.com/rel/missing").is_none());
     }
 }

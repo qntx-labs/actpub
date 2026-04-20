@@ -265,29 +265,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_or_many_single_value_roundtrips() {
+    fn one_or_many_single_value_serialises_as_bare_value() {
         let value = OneOrMany::one("hello".to_owned());
-        let json = serde_json::to_value(&value).unwrap();
+        let json = serde_json::to_value(&value).expect("serialise");
         assert_eq!(json, json!("hello"));
 
-        let back: OneOrMany<String> = serde_json::from_value(json).unwrap();
+        let back: OneOrMany<String> = serde_json::from_value(json).expect("deserialise");
         assert_eq!(back, value);
     }
 
     #[test]
-    fn one_or_many_multi_value_roundtrips() {
+    fn one_or_many_multi_value_serialises_as_array() {
         let value = OneOrMany::many(vec![1_i32, 2, 3]);
-        let json = serde_json::to_value(&value).unwrap();
+        let json = serde_json::to_value(&value).expect("serialise");
         assert_eq!(json, json!([1, 2, 3]));
 
-        let back: OneOrMany<i32> = serde_json::from_value(json).unwrap();
+        let back: OneOrMany<i32> = serde_json::from_value(json).expect("deserialise");
         assert_eq!(back, value);
     }
 
     #[test]
-    fn one_or_many_accepts_single_on_deserialize() {
-        let back: OneOrMany<String> = serde_json::from_value(json!("only")).unwrap();
-        assert_eq!(back.as_slice(), &["only".to_owned()]);
+    fn one_or_many_empty_serialises_as_empty_array() {
+        let value: OneOrMany<String> = OneOrMany::new();
+        let json = serde_json::to_value(&value).expect("serialise");
+        assert_eq!(json, json!([]));
+    }
+
+    #[test]
+    fn one_or_many_deserialises_null_as_empty() {
+        // Mastodon and Misskey frequently emit `null` for absent
+        // array-typed properties (e.g. `inReplyTo: null`). Treating this
+        // as an empty collection preserves lossless roundtrip semantics
+        // for everything except the null literal itself.
+        let back: OneOrMany<String> =
+            serde_json::from_value(json!(null)).expect("null must deserialise");
+        assert!(back.is_empty(), "null must yield an empty collection");
+    }
+
+    #[test]
+    fn one_or_many_collects_from_iterator() {
+        let value: OneOrMany<i32> = [1, 2, 3].into_iter().collect();
+        assert_eq!(value.as_slice(), &[1, 2, 3]);
     }
 
     #[test]

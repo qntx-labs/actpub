@@ -458,15 +458,32 @@ mod tests {
     }
 
     #[test]
-    fn is_public_detects_all_spellings() {
+    fn is_public_detects_bare_url_in_to() {
         let mut obj = Object::with_kind("Note");
-        obj.to = OneOrMany::one(UrlOr::Url(Url::parse(Public::URI).unwrap()));
+        obj.to = OneOrMany::one(UrlOr::Url(
+            Url::parse(Public::URI).expect("Public::URI must parse"),
+        ));
         assert!(obj.is_public());
+    }
 
-        let mut obj2 = Object::with_kind("Note");
-        let public_obj = Object::with_id(Object::new(), Url::parse(Public::URI).unwrap());
-        obj2.cc = OneOrMany::one(UrlOr::Object(Box::new(public_obj)));
-        assert!(obj2.is_public());
+    #[test]
+    fn is_public_detects_inlined_object_in_cc() {
+        let mut obj = Object::with_kind("Note");
+        let public_obj =
+            Object::new().with_id(Url::parse(Public::URI).expect("Public::URI must parse"));
+        obj.cc = OneOrMany::one(UrlOr::Object(Box::new(public_obj)));
+        assert!(obj.is_public());
+    }
+
+    #[test]
+    fn is_public_detects_target_in_audience() {
+        // `audience` is one of the three public-addressing fields per
+        // ActivityPub §5.6.
+        let mut obj = Object::with_kind("Note");
+        obj.audience = OneOrMany::one(UrlOr::Url(
+            Url::parse(Public::URI).expect("Public::URI must parse"),
+        ));
+        assert!(obj.is_public());
     }
 
     #[test]
