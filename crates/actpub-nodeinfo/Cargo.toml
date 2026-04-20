@@ -13,6 +13,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 reqwest = { workspace = true, optional = true }
 
 [features]
