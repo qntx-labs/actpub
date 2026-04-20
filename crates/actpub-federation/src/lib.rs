@@ -34,9 +34,11 @@
 )]
 
 mod config;
+mod deliver;
 mod error;
 mod fetcher;
 mod policy;
+mod retry;
 
 use actpub_activitystreams as _;
 use actpub_core as _;
@@ -59,12 +61,14 @@ pub use self::config::{
     DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL, DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_REQUEST_TIMEOUT, FederationConfig, default_user_agent,
 };
+pub use self::deliver::{Deliverer, ReqwestDeliverer};
 pub use self::error::Error;
 pub use self::fetcher::{
     AP_ACCEPT_HEADER, AP_CONTENT_TYPE, Fetcher, LD_CONTENT_TYPE_PREFIX, ReqwestFetcher,
     signed_fetch_signature_header,
 };
 pub use self::policy::UrlPolicy;
+pub use self::retry::RetryPolicy;
 
 /// Crate [`Result`] alias defaulting to [`Error`].
 pub type Result<T, E = Error> = core::result::Result<T, E>;
