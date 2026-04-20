@@ -125,7 +125,9 @@ impl<'a> CavageSigner<'a> {
 
         let params = CavageHeaderParams {
             key_id: self.key_id.to_owned(),
-            algorithm: self.emit_algorithm.then(|| algorithm_name(self.key)),
+            algorithm: self
+                .emit_algorithm
+                .then(|| algorithm_name(self.key).to_owned()),
             headers: self.headers.clone(),
             signature: sig_b64,
             created: self.created,
@@ -142,10 +144,10 @@ impl<'a> CavageSigner<'a> {
     }
 }
 
-fn algorithm_name(key: &SigningKey) -> String {
+const fn algorithm_name(key: &SigningKey) -> &'static str {
     match key.algorithm() {
-        Algorithm::RsaSha256 => "rsa-sha256".to_owned(),
-        Algorithm::Ed25519 => "ed25519".to_owned(),
+        Algorithm::RsaSha256 => "rsa-sha256",
+        Algorithm::Ed25519 => "ed25519",
     }
 }
 

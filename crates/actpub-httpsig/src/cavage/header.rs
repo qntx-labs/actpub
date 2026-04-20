@@ -99,6 +99,10 @@ impl CavageHeaderParams {
     }
 
     /// Serialises back into a `Signature:` header value.
+    ///
+    /// String-valued parameters (`keyId`, `algorithm`, `headers`,
+    /// `signature`) are quoted and any `\` or `"` character inside
+    /// them is backslash-escaped per the Cavage quoted-string grammar.
     #[must_use]
     #[allow(
         clippy::expect_used,
@@ -108,30 +112,59 @@ impl CavageHeaderParams {
         use core::fmt::Write as _;
         let mut out = String::new();
         let infallible = "writing to an owned String is infallible";
-        write!(out, r#"keyId="{}""#, self.key_id).expect(infallible);
+        write!(out, r#"keyId="{}""#, escape_quoted(&self.key_id)).expect(infallible);
         if let Some(alg) = &self.algorithm {
-            write!(out, r#",algorithm="{alg}""#).expect(infallible);
+            write!(out, r#",algorithm="{}""#, escape_quoted(alg)).expect(infallible);
         }
-        write!(out, r#",headers="{}""#, self.headers.join_spaces()).expect(infallible);
+        write!(
+            out,
+            r#",headers="{}""#,
+            escape_quoted(&self.headers.join_spaces()),
+        )
+        .expect(infallible);
         if let Some(c) = self.created {
             write!(out, ",created={c}").expect(infallible);
         }
         if let Some(e) = self.expires {
             write!(out, ",expires={e}").expect(infallible);
         }
-        write!(out, r#",signature="{}""#, self.signature).expect(infallible);
+        write!(out, r#",signature="{}""#, escape_quoted(&self.signature)).expect(infallible);
         out
     }
 }
 
+/// Applies the Cavage quoted-string escape rules: `\` → `\\` and
+/// `"` → `\"`. All other bytes pass through unchanged.
+fn escape_quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Splits the raw header on top-level commas, skipping commas inside
 /// double-quoted regions so that `signature="a,b,c"` does not break.
+///
+/// The scanner also honours the quoted-string escape sequence `\X`,
+/// treating the next character as literal content. Without this a
+/// payload containing `\"` would prematurely terminate the quoted
+/// region and let an attacker inject additional parameter pairs.
 fn split_top_level_commas(raw: &str) -> impl Iterator<Item = &str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let mut escaped = false;
     for (i, c) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
             ',' if !in_quotes => {
                 parts.push(&raw[start..i]);
@@ -279,10 +312,34 @@ mod tests {
     }
 
     #[test]
-    fn quoted_string_with_trailing_backslash_is_rejected() {
-        // A lone trailing backslash inside a quoted string is an
-        // encoding error; previously this was silently dropped.
-        let raw = r#"keyId="k\",headers="host",signature="Zm9v""#;
+    fn escaped_double_quote_inside_quoted_string_survives_splitting() {
+        // Without the escape-aware splitter this payload would split
+        // early at the `"` inside `evil"`, dropping the `,attacker=`
+        // trailer into a separate parameter.
+        let raw = r#"keyId="legit\"evil",headers="host",signature="Zm9v""#;
+        let params = CavageHeaderParams::parse(raw).expect("parse");
+        assert_eq!(params.key_id, r#"legit"evil"#);
+    }
+
+    #[test]
+    fn to_header_value_escapes_embedded_quote_and_backslash() {
+        let raw = r#"keyId="legit\"evil\\trail",headers="host",signature="Zm9v""#;
+        let params = CavageHeaderParams::parse(raw).expect("parse");
+        let emitted = params.to_header_value();
+        // Re-parsing must recover the same logical value.
+        let reparsed = CavageHeaderParams::parse(&emitted).expect("reparse escaped");
+        assert_eq!(reparsed.key_id, r#"legit"evil\trail"#);
+        // And the escapes must actually be present on the wire.
+        assert!(emitted.contains(r#"\""#));
+        assert!(emitted.contains(r"\\"));
+    }
+
+    #[test]
+    fn parameter_value_with_lone_trailing_backslash_is_rejected() {
+        // A quoted value whose contents end in an unpaired backslash
+        // is an encoding error: the parser has no way to know which
+        // character the `\` was meant to escape.
+        let raw = r#"keyId="abc\""#;
         let err = CavageHeaderParams::parse(raw).expect_err("malformed escape must fail");
         assert!(matches!(err, Error::MalformedSignatureHeader(_)));
     }

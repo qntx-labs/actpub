@@ -19,12 +19,25 @@ use httpdate::parse_http_date;
 
 use crate::error::Error;
 
-/// Tunables governing which signed timestamps are accepted at
+/// Minimum Cavage header set every compliant verifier should enforce.
+///
+/// The three names together bind the signature to the exact request
+/// URI — omitting any of them lets an intermediary replay a captured
+/// signature against a different path or a different virtual host.
+/// Mastodon's own verifier hard-codes this requirement, so matching it
+/// keeps us bug-for-bug compatible with the reference Fediverse
+/// implementation.
+pub const CAVAGE_REQUIRED_HEADERS: &[&str] = &["(request-target)", "host", "date"];
+
+/// Tunables governing which signed requests are accepted at
 /// verification time.
 ///
 /// A `max_age` of `None` disables the past-side check and a
 /// `max_clock_skew_future` of `None` disables the future-side check;
-/// both default to `Some(...)` in the presets.
+/// both default to `Some(...)` in the presets. `cavage_required_headers`
+/// defaults to [`CAVAGE_REQUIRED_HEADERS`], and `allow_multiple_signatures`
+/// defaults to `false` — callers that need the historical permissive
+/// behaviour can flip either knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VerifyPolicy {
@@ -43,11 +56,27 @@ pub struct VerifyPolicy {
     /// a `Date` header is rejected. Defaults to `false` to stay
     /// compatible with servers that only emit one of the two.
     pub require_timestamp: bool,
+
+    /// Cavage-specific: the list of header names whose presence in the
+    /// `headers=` parameter is mandatory. A signature whose coverage
+    /// does not include every name listed here is rejected with
+    /// [`Error::RequiredHeaderAbsent`]. The names are compared
+    /// case-insensitively.
+    pub cavage_required_headers: &'static [&'static str],
+
+    /// If `false` (the default), a `Signature-Input:` header containing
+    /// more than one label is rejected outright. Mastodon and the RFC
+    /// 9421 interop profile both expect exactly one signature per
+    /// request; permitting additional labels opens a fallback channel
+    /// an attacker can use to bypass policy by attaching a second
+    /// signature of their own.
+    pub allow_multiple_signatures: bool,
 }
 
 impl VerifyPolicy {
     /// Returns the policy Mastodon applies to inbound federated
-    /// requests: 12 hours past, 5 minutes future, timestamps optional.
+    /// requests: 12 hours past, 5 minutes future, timestamps optional,
+    /// and the Cavage minimum header set enforced.
     ///
     /// See <https://docs.joinmastodon.org/spec/security/>.
     #[must_use]
@@ -56,18 +85,23 @@ impl VerifyPolicy {
             max_age: Some(Duration::hours(12)),
             max_clock_skew_future: Some(Duration::minutes(5)),
             require_timestamp: false,
+            cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            allow_multiple_signatures: false,
         }
     }
 
     /// Returns a tight policy appropriate for internal services where
     /// every hop has NTP-synchronised clocks: 5 minutes past, 1 minute
-    /// future, and timestamps are mandatory.
+    /// future, timestamps mandatory, Cavage minimum header set
+    /// enforced, and multi-signature requests rejected.
     #[must_use]
     pub const fn strict() -> Self {
         Self {
             max_age: Some(Duration::minutes(5)),
             max_clock_skew_future: Some(Duration::minutes(1)),
             require_timestamp: true,
+            cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            allow_multiple_signatures: false,
         }
     }
 
@@ -82,6 +116,8 @@ impl VerifyPolicy {
             max_age: None,
             max_clock_skew_future: None,
             require_timestamp: false,
+            cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            allow_multiple_signatures: false,
         }
     }
 

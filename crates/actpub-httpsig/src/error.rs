@@ -27,10 +27,15 @@ pub enum Error {
     UnsupportedAlgorithm(String),
 
     /// The RSA key size was outside the supported range.
+    ///
+    /// The bounds mirror `aws-lc-rs`'s
+    /// `RSA_PKCS1_2048_8192_SHA256` verification profile: any modulus
+    /// width between 2048 and 8192 bits (inclusive) whose byte count is
+    /// whole (i.e. divisible by 8) is accepted.
     #[error(
         "unsupported RSA key size {0} bits; only {min}-{max} supported",
         min = 2048,
-        max = 4096
+        max = 8192
     )]
     UnsupportedRsaSize(u32),
 

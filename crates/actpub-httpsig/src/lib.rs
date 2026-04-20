@@ -9,8 +9,11 @@
 //!
 //! Algorithms supported out of the box:
 //!
-//! - `rsa-sha256` (2048/4096-bit) — legacy main-key format, required for
-//!   interop with current Mastodon
+//! - `rsa-sha256` (2048–8192-bit modulus) — legacy main-key format,
+//!   required for interop with current Mastodon; [`RsaBits`] exposes
+//!   the conventional 2048 and 4096 presets for generation, and
+//!   [`RsaSigningKey::from_pkcs8_der`] accepts any byte-aligned width
+//!   in the full range
 //! - `ed25519` — FEP-521a Multikey, recommended for new deployments
 //!
 //! All cryptographic primitives are backed by [aws-lc-rs], a memory-safe,
@@ -93,14 +96,14 @@ pub use self::key::{
     Algorithm, Ed25519PublicKey, Ed25519SigningKey, Multikey, RsaBits, RsaPublicKey, RsaSigningKey,
     SigningKey, VerifyingKey,
 };
-pub use self::policy::VerifyPolicy;
+pub use self::policy::{CAVAGE_REQUIRED_HEADERS, VerifyPolicy};
 pub use self::rfc9421::{
     Component, DEFAULT_COMPONENTS as RFC9421_DEFAULT_COMPONENTS, Rfc9421Signer, Rfc9421Verified,
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_dict, parse_signature_input_dict,
     rfc9421_verify, rfc9421_verify_with_policy, serialise_signature_dict,
     serialise_signature_input_dict,
 };
-pub use self::verify::{Verified, verify, verify_with_policy};
+pub use self::verify::{REDACTED_HEADERS_DEFAULT, Verified, verify, verify_with_policy};
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].
 pub type Result<T, E = Error> = core::result::Result<T, E>;

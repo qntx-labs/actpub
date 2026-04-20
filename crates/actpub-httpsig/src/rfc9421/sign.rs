@@ -13,9 +13,15 @@ use crate::rfc9421::signature_input::{
 
 /// Default component sequence emitted by [`Rfc9421Signer::new`].
 ///
-/// Chosen to mirror the Cavage default, making side-by-side dual-stack
-/// signing cheap (both signers cover the same semantic ground).
-pub const DEFAULT_COMPONENTS: &[&str] = &["@method", "@target-uri", "host", "date", "digest"];
+/// Mirrors the Cavage default in every respect except the body digest,
+/// which follows the modern RFC 9530 `Content-Digest:` form that RFC
+/// 9421 implementations expect (Mastodon 4.5+, Mitra, Takahē). Callers
+/// running in dual-stack deployments attach the legacy `Digest:` header
+/// for their Cavage signer and the modern `Content-Digest:` header for
+/// this one; both names can be emitted side by side, since receivers
+/// simply ignore headers they do not recognise.
+pub const DEFAULT_COMPONENTS: &[&str] =
+    &["@method", "@target-uri", "host", "date", "content-digest"];
 
 /// A request signer that produces RFC 9421 `Signature-Input:` and
 /// `Signature:` headers.
@@ -128,7 +134,7 @@ impl<'a> Rfc9421Signer<'a> {
         let input = SignatureInput {
             components: self.components.clone(),
             keyid: Some(self.key_id.to_owned()),
-            algorithm: self.emit_alg.then(|| algorithm_name(self.key)),
+            algorithm: self.emit_alg.then(|| algorithm_name(self.key).to_owned()),
             created: self.created,
             expires: self.expires,
             nonce: self.nonce.clone(),
@@ -147,10 +153,10 @@ impl<'a> Rfc9421Signer<'a> {
     }
 }
 
-fn algorithm_name(key: &SigningKey) -> String {
+const fn algorithm_name(key: &SigningKey) -> &'static str {
     match key.algorithm() {
-        Algorithm::RsaSha256 => "rsa-v1_5-sha256".to_owned(),
-        Algorithm::Ed25519 => "ed25519".to_owned(),
+        Algorithm::RsaSha256 => "rsa-v1_5-sha256",
+        Algorithm::Ed25519 => "ed25519",
     }
 }
 
@@ -169,7 +175,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::digest::sha256_digest_header;
+    use crate::content_digest::content_digest_header;
     use crate::rfc9421::signature::parse_signature_dict;
     use crate::rfc9421::signature_input::parse_signature_input_dict;
 
@@ -180,7 +186,7 @@ mod tests {
             .uri("https://example.com/inbox")
             .header("host", "example.com")
             .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
-            .header("digest", sha256_digest_header(body))
+            .header("content-digest", content_digest_header(body))
             .body(body.to_vec())
             .expect("valid")
     }

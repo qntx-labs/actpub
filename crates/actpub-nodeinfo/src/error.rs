@@ -29,6 +29,15 @@ pub enum Error {
     #[error("NodeInfo server returned status {0}")]
     BadStatus(u16),
 
+    /// The response body exceeded the configured maximum size. Raised
+    /// only by the client helpers, which cap incoming bodies to a
+    /// generous default (see
+    /// [`DEFAULT_MAX_BODY_BYTES`](crate::DEFAULT_MAX_BODY_BYTES)).
+    #[cfg(feature = "client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+    #[error("NodeInfo response body exceeds the {0}-byte limit")]
+    ResponseTooLarge(u64),
+
     /// The response body could not be parsed as JSON.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

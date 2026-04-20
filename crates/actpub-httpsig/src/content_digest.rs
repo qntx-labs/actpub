@@ -73,12 +73,19 @@ impl DigestAlgorithm {
 
     /// Parses the IANA token into an algorithm variant. Returns `None`
     /// for tokens this crate does not recognise.
+    ///
+    /// RFC 9530 mandates the lowercase canonical form on the wire, but
+    /// real-world senders occasionally emit `SHA-256`; we follow
+    /// Postel's law and accept any ASCII casing on the read side while
+    /// still emitting the canonical form.
     #[must_use]
-    pub fn from_token(token: &str) -> Option<Self> {
-        match token {
-            "sha-256" => Some(Self::Sha256),
-            "sha-512" => Some(Self::Sha512),
-            _ => None,
+    pub const fn from_token(token: &str) -> Option<Self> {
+        if token.eq_ignore_ascii_case("sha-256") {
+            Some(Self::Sha256)
+        } else if token.eq_ignore_ascii_case("sha-512") {
+            Some(Self::Sha512)
+        } else {
+            None
         }
     }
 }
@@ -375,5 +382,17 @@ mod tests {
             assert_eq!(DigestAlgorithm::from_token(token), Some(algo));
         }
         assert_eq!(DigestAlgorithm::from_token("sha-1"), None);
+    }
+
+    #[test]
+    fn from_token_is_case_insensitive_for_postel_tolerance() {
+        assert_eq!(
+            DigestAlgorithm::from_token("SHA-256"),
+            Some(DigestAlgorithm::Sha256)
+        );
+        assert_eq!(
+            DigestAlgorithm::from_token("Sha-512"),
+            Some(DigestAlgorithm::Sha512)
+        );
     }
 }

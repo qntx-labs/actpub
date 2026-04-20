@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actpub"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "actpub-activitystreams",
  "actpub-axum",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-activitystreams"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "mime",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-axum"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "actpub-federation",
  "actpub-httpsig",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "actpub-activitystreams",
  "actpub-httpsig",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-federation"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "actpub-activitystreams",
  "actpub-core",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-httpsig"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aws-lc-rs",
  "base64ct",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-nodeinfo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pretty_assertions",
  "reqwest",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "actpub-webfinger"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "idna",
  "percent-encoding",

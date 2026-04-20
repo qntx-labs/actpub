@@ -4,6 +4,12 @@
 //! keys, and `PUBLIC KEY` (`SubjectPublicKeyInfo`) for the public half. The
 //! Fediverse actor `publicKey.publicKeyPem` field follows the SPKI form.
 
+use pkcs8::der::asn1::AnyRef;
+use pkcs8::{
+    AlgorithmIdentifierRef, ObjectIdentifier, PrivateKeyInfo, SubjectPublicKeyInfoRef,
+    der::{Decode, Encode},
+};
+
 use crate::error::Error;
 use crate::key::ed25519::{ED25519_PUBLIC_KEY_LEN, Ed25519PublicKey, Ed25519SigningKey};
 use crate::key::rsa::{RsaPublicKey, RsaSigningKey};
@@ -13,18 +19,19 @@ pub(crate) const PEM_LABEL_PRIVATE_KEY: &str = "PRIVATE KEY";
 
 /// PEM label for a legacy `RSA PRIVATE KEY` (PKCS#1).
 ///
-/// We do not emit this form but accept it on input for interoperability
-/// with older tooling.
+/// Accepted on input for interoperability with OpenSSL-generated keys
+/// and Fediverse implementations that still emit PKCS#1. We re-encode
+/// such keys to PKCS#8 before handing them to the cryptographic backend.
 pub(crate) const PEM_LABEL_RSA_PRIVATE_KEY: &str = "RSA PRIVATE KEY";
 
 /// PEM label for a `SubjectPublicKeyInfo` public key.
 pub(crate) const PEM_LABEL_PUBLIC_KEY: &str = "PUBLIC KEY";
 
-/// OID of `id-Ed25519` (RFC 8410).
-const OID_ED25519: [u8; 3] = [0x2b, 0x65, 0x70];
+/// `id-Ed25519` (RFC 8410).
+const OID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
 
-/// OID of `rsaEncryption` (PKCS#1).
-const OID_RSA_ENCRYPTION: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+/// `rsaEncryption` (RFC 8017, PKCS#1).
+const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
 /// Decodes a PEM `PRIVATE KEY` into an [`Ed25519SigningKey`].
 ///
@@ -42,10 +49,11 @@ pub(crate) fn ed25519_signing_key_from_pem(pem_text: &str) -> Result<Ed25519Sign
         ));
     }
     let der = block.contents();
-    if !pkcs8_algorithm_matches(der, &OID_ED25519) {
-        return Err(Error::UnsupportedAlgorithm(
-            "PKCS#8 body does not identify an Ed25519 key".into(),
-        ));
+    let oid = parse_pkcs8_algorithm_oid(der)?;
+    if oid != OID_ED25519 {
+        return Err(Error::UnsupportedAlgorithm(format!(
+            "PKCS#8 body identifies algorithm {oid}, expected id-Ed25519 (1.3.101.112)"
+        )));
     }
     Ed25519SigningKey::from_pkcs8_der(der)
 }
@@ -71,22 +79,19 @@ pub(crate) fn ed25519_public_key_from_pem(pem_text: &str) -> Result<Ed25519Publi
             PEM_LABEL_PUBLIC_KEY,
         ));
     }
-    let spki = block.contents();
-    if !spki_algorithm_matches(spki, &OID_ED25519) {
-        return Err(Error::UnsupportedAlgorithm(
-            "SPKI body does not identify an Ed25519 key".into(),
-        ));
+    let (oid, bits) = parse_spki(block.contents())?;
+    if oid != OID_ED25519 {
+        return Err(Error::UnsupportedAlgorithm(format!(
+            "SPKI body identifies algorithm {oid}, expected id-Ed25519 (1.3.101.112)"
+        )));
     }
-    let raw = spki_public_key_bits(spki).ok_or_else(|| {
-        Error::InvalidPem("SubjectPublicKeyInfo body truncated or malformed".into())
-    })?;
-    if raw.len() != ED25519_PUBLIC_KEY_LEN {
+    if bits.len() != ED25519_PUBLIC_KEY_LEN {
         return Err(Error::InvalidMultikeyLength {
             expected: ED25519_PUBLIC_KEY_LEN,
-            actual: raw.len(),
+            actual: bits.len(),
         });
     }
-    Ed25519PublicKey::from_bytes(raw)
+    Ed25519PublicKey::from_bytes(bits)
 }
 
 /// Encodes an Ed25519 public key as a PEM `PUBLIC KEY`.
@@ -99,6 +104,11 @@ pub(crate) fn ed25519_public_key_to_pem(key: &Ed25519PublicKey) -> String {
 /// Decodes a PEM `PRIVATE KEY` (or legacy `RSA PRIVATE KEY`) into an
 /// [`RsaSigningKey`].
 ///
+/// Both PKCS#8 `PrivateKeyInfo` and the legacy PKCS#1 `RSAPrivateKey`
+/// envelopes are accepted on input; the latter is wrapped into PKCS#8
+/// on the fly before being handed to the cryptographic backend, so
+/// callers never need to shell out to OpenSSL just to re-encode.
+///
 /// # Errors
 ///
 /// Same shape as the Ed25519 equivalent, plus [`Error::UnsupportedRsaSize`]
@@ -108,18 +118,19 @@ pub(crate) fn rsa_signing_key_from_pem(pem_text: &str) -> Result<RsaSigningKey, 
     match block.tag() {
         PEM_LABEL_PRIVATE_KEY => {
             let der = block.contents();
-            if !pkcs8_algorithm_matches(der, &OID_RSA_ENCRYPTION) {
-                return Err(Error::UnsupportedAlgorithm(
-                    "PKCS#8 body does not identify an RSA key".into(),
-                ));
+            let oid = parse_pkcs8_algorithm_oid(der)?;
+            if oid != OID_RSA_ENCRYPTION {
+                return Err(Error::UnsupportedAlgorithm(format!(
+                    "PKCS#8 body identifies algorithm {oid}, expected rsaEncryption \
+                     (1.2.840.113549.1.1.1)"
+                )));
             }
             RsaSigningKey::from_pkcs8_der(der)
         }
-        PEM_LABEL_RSA_PRIVATE_KEY => Err(Error::UnsupportedAlgorithm(
-            "legacy `RSA PRIVATE KEY` PEM is not yet supported; please \
-             re-encode as PKCS#8 `PRIVATE KEY`"
-                .into(),
-        )),
+        PEM_LABEL_RSA_PRIVATE_KEY => {
+            let pkcs8 = wrap_pkcs1_rsa_as_pkcs8(block.contents())?;
+            RsaSigningKey::from_pkcs8_der(&pkcs8)
+        }
         other => Err(Error::UnexpectedPemLabel(
             other.to_owned(),
             PEM_LABEL_PRIVATE_KEY,
@@ -147,13 +158,14 @@ pub(crate) fn rsa_public_key_from_pem(pem_text: &str) -> Result<RsaPublicKey, Er
             PEM_LABEL_PUBLIC_KEY,
         ));
     }
-    let spki = block.contents();
-    if !spki_algorithm_matches(spki, &OID_RSA_ENCRYPTION) {
-        return Err(Error::UnsupportedAlgorithm(
-            "SPKI body does not identify an RSA key".into(),
-        ));
+    let (oid, _bits) = parse_spki(block.contents())?;
+    if oid != OID_RSA_ENCRYPTION {
+        return Err(Error::UnsupportedAlgorithm(format!(
+            "SPKI body identifies algorithm {oid}, expected rsaEncryption \
+             (1.2.840.113549.1.1.1)"
+        )));
     }
-    RsaPublicKey::from_spki_der(spki)
+    RsaPublicKey::from_spki_der(block.contents())
 }
 
 /// Encodes an RSA public key as a PEM `PUBLIC KEY` (SPKI).
@@ -171,64 +183,40 @@ fn encode_pem(label: &'static str, der: &[u8]) -> String {
     pem::encode(&block)
 }
 
-/// Returns `true` when the given PKCS#8 `PrivateKeyInfo` DER declares the
-/// supplied algorithm OID.
-///
-/// Performs a conservative substring match on the DER so that we do not
-/// need a full ASN.1 parser here; the worst-case false positive is a key
-/// whose parameters happen to encode the same OID byte sequence, which
-/// would then be handed to `aws-lc-rs` and rejected at load time.
-fn pkcs8_algorithm_matches(der: &[u8], oid: &[u8]) -> bool {
-    find_subsequence(der, oid).is_some()
+/// Extracts the `algorithm.oid` field from a PKCS#8 `PrivateKeyInfo`
+/// DER blob via a full ASN.1 parse. Replaces the old substring heuristic
+/// so that we never misclassify a key whose parameters happen to contain
+/// a byte sequence overlapping an unrelated OID.
+fn parse_pkcs8_algorithm_oid(der: &[u8]) -> Result<ObjectIdentifier, Error> {
+    let info = PrivateKeyInfo::from_der(der).map_err(|e| Error::InvalidPkcs8(e.to_string()))?;
+    Ok(info.algorithm.oid)
 }
 
-/// Same conservative check as above, for SPKI.
-fn spki_algorithm_matches(der: &[u8], oid: &[u8]) -> bool {
-    find_subsequence(der, oid).is_some()
+/// Parses a `SubjectPublicKeyInfo` DER blob into its algorithm OID and
+/// the raw `subjectPublicKey` bit string bytes.
+fn parse_spki(der: &[u8]) -> Result<(ObjectIdentifier, &[u8]), Error> {
+    let spki =
+        SubjectPublicKeyInfoRef::from_der(der).map_err(|e| Error::InvalidPem(e.to_string()))?;
+    let bits = spki.subject_public_key.as_bytes().ok_or_else(|| {
+        Error::InvalidPem(
+            "SubjectPublicKeyInfo.subjectPublicKey is not a well-formed BIT STRING".into(),
+        )
+    })?;
+    Ok((spki.algorithm.oid, bits))
 }
 
-/// Extracts the raw public-key bit string from a `SubjectPublicKeyInfo`.
-///
-/// The SPKI ASN.1 structure is:
-///
-/// ```text
-/// SEQUENCE {
-///     SEQUENCE { algorithmIdentifier }
-///     BIT STRING { subjectPublicKey }
-/// }
-/// ```
-///
-/// We scan for the BIT STRING (tag `0x03`) and return its unused-bits-stripped
-/// body. This is sufficient for Ed25519 where the SPKI has a fixed shape.
-fn spki_public_key_bits(der: &[u8]) -> Option<&[u8]> {
-    // Find the last `0x03` tag followed by a length and a zero unused-bits
-    // byte. Ed25519 SPKI is always 44 bytes total, so we locate the final
-    // BIT STRING deterministically.
-    let mut last: Option<&[u8]> = None;
-    for idx in 0..der.len().saturating_sub(2) {
-        if der.get(idx) != Some(&0x03) {
-            continue;
-        }
-        let Some(&len_byte) = der.get(idx + 1) else {
-            continue;
-        };
-        let len = len_byte as usize;
-        let body_start = idx + 2;
-        let body_end = body_start + len;
-        if body_end > der.len() || len < 1 {
-            continue;
-        }
-        if der.get(body_start) != Some(&0x00) {
-            continue;
-        }
-        last = der.get(body_start + 1..body_end);
-    }
-    last
-}
-
-/// Returns the byte offset at which `needle` first appears inside `haystack`.
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Wraps a PKCS#1 `RSAPrivateKey` DER blob in the PKCS#8 envelope
+/// expected by `aws-lc-rs`, attaching the `rsaEncryption` algorithm
+/// identifier with the mandatory NULL parameters.
+fn wrap_pkcs1_rsa_as_pkcs8(pkcs1_der: &[u8]) -> Result<Vec<u8>, Error> {
+    let info = PrivateKeyInfo::new(
+        AlgorithmIdentifierRef {
+            oid: OID_RSA_ENCRYPTION,
+            parameters: Some(AnyRef::NULL),
+        },
+        pkcs1_der,
+    );
+    info.to_der().map_err(|e| Error::InvalidPem(e.to_string()))
 }
 
 /// Builds a `SubjectPublicKeyInfo` DER for an Ed25519 public key (44 bytes).
@@ -246,10 +234,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn ed25519_spki_der(key_bytes: &[u8; ED25519_PUBLIC_KEY_LEN]) -> Vec<u8> {
     let mut out = Vec::with_capacity(44);
     out.extend_from_slice(&[
-        0x30, 0x2A, // SEQUENCE (42)
-        0x30, 0x05, // SEQUENCE (5) — algorithm identifier
-        0x06, 0x03, 0x2B, 0x65, 0x70, // OID 1.3.101.112 (id-Ed25519)
-        0x03, 0x21, 0x00, // BIT STRING (33), 0 unused bits
+        0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
     ]);
     out.extend_from_slice(key_bytes);
     out
@@ -313,11 +298,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rsa_private_key_label_returns_helpful_error() {
+    fn malformed_rsa_private_key_pem_is_rejected() {
+        // Valid PEM framing but the body is not a well-formed PKCS#1
+        // RSAPrivateKey, so the PKCS#8 wrapper produces junk DER that
+        // the backend refuses. The observable error kind is not
+        // specified here — we only care that it fails cleanly.
         let pem = "-----BEGIN RSA PRIVATE KEY-----\n\
                    AAAA\n\
                    -----END RSA PRIVATE KEY-----\n";
-        let err = rsa_signing_key_from_pem(pem).expect_err("must reject legacy label");
-        assert!(matches!(err, Error::UnsupportedAlgorithm(_)));
+        rsa_signing_key_from_pem(pem).expect_err("malformed PKCS#1 body must fail");
+    }
+
+    #[test]
+    fn legacy_pkcs1_rsa_private_key_pem_is_accepted() {
+        // Round-trip a freshly generated RSA key through the PKCS#1
+        // envelope to verify the on-the-fly wrapper produces a PKCS#8
+        // blob the backend accepts.
+        let key = RsaSigningKey::generate(RsaBits::Rsa2048).expect("rng");
+        let pkcs8_pem = rsa_signing_key_to_pem(&key);
+        // Convert the PKCS#8 `PRIVATE KEY` PEM to a `RSA PRIVATE KEY`
+        // PEM by unwrapping the PKCS#8 OCTET STRING back to the
+        // PKCS#1 body. The test below does this the cheap way by
+        // asking `pkcs8` to parse and then re-emitting just the
+        // `private_key` field.
+        let pkcs8_der = {
+            let block = parse_single_pem(&pkcs8_pem).expect("re-parse");
+            block.contents().to_vec()
+        };
+        let pkcs1_body = {
+            let info = PrivateKeyInfo::from_der(&pkcs8_der).expect("pkcs8 decode");
+            info.private_key.to_vec()
+        };
+        let pkcs1_pem = encode_pem(PEM_LABEL_RSA_PRIVATE_KEY, &pkcs1_body);
+        let reloaded = rsa_signing_key_from_pem(&pkcs1_pem).expect("accept PKCS#1");
+        assert_eq!(reloaded.bits(), key.bits());
+    }
+
+    #[test]
+    fn pkcs8_with_non_rsa_oid_reports_algorithm_mismatch() {
+        // An Ed25519 PKCS#8 fed into the RSA loader must surface a
+        // precise algorithm-mismatch error rather than a low-level
+        // backend message.
+        let ed = Ed25519SigningKey::generate().expect("rng");
+        let pem = ed25519_signing_key_to_pem(&ed);
+        let err = rsa_signing_key_from_pem(&pem).expect_err("Ed25519 key must not load as RSA");
+        assert!(matches!(err, Error::UnsupportedAlgorithm(msg) if msg.contains("rsaEncryption")));
     }
 }

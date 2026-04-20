@@ -150,6 +150,23 @@ pub struct Object {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_map: Option<LanguageMap>,
 
+    /// `ActivityPub` §3.3 `source` property carrying the original
+    /// representation of the content before transformation to
+    /// [`content`](Self::content). Commonly set to
+    /// `{"content": "...", "mediaType": "text/markdown"}` by Lemmy,
+    /// `PeerTube` and other Fediverse implementations that need a
+    /// lossless edit channel distinct from the rendered HTML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<ObjectRef>>,
+
+    /// Activity Streams 2.0 extension `as:sensitive`: marks content
+    /// as requiring a content warning before display. Mastodon uses
+    /// this to gate media behind a "show more" control; flipping it
+    /// on objects without media still propagates the cw flag to
+    /// compatible clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<bool>,
+
     /// Tags (mentions, hashtags, emoji) linked to this object.
     #[serde(default, skip_serializing_if = "OneOrMany::is_empty")]
     pub tag: OneOrMany<ObjectRef>,
@@ -566,6 +583,23 @@ mod tests {
     }
 
     #[test]
+    fn source_and_sensitive_roundtrip_through_wire_format() {
+        let note_json = json!({
+            "type": "Note",
+            "content": "<p>rendered</p>",
+            "source": {
+                "content": "rendered",
+                "mediaType": "text/markdown",
+            },
+            "sensitive": true,
+        });
+        let obj: Object = serde_json::from_value(note_json.clone()).expect("parse");
+        assert_eq!(obj.sensitive, Some(true));
+        assert!(obj.source.is_some());
+        assert_eq!(serde_json::to_value(&obj).unwrap(), note_json);
+    }
+
+    #[test]
     fn is_public_detects_target_in_audience() {
         // `audience` is one of the three public-addressing fields per
         // ActivityPub §5.6.
@@ -696,7 +730,7 @@ mod tests {
         assert_eq!(obj.content.as_deref(), Some("<p>Hello, Fediverse</p>"));
         assert!(obj.is_public());
         assert_eq!(obj.attributed_to.len(), 1);
-        assert!(obj.extra.contains_key("sensitive"));
+        assert_eq!(obj.sensitive, Some(false));
         // `inReplyTo: null` should be absorbed without failure
     }
 

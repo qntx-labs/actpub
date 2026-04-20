@@ -1,25 +1,141 @@
 //! Asynchronous `NodeInfo` client built on [`reqwest`].
+//!
+//! # Security considerations
+//!
+//! `NodeInfo` documents come from untrusted remote servers, so this
+//! client applies the same hardening as the sibling `WebFinger`
+//! client:
+//!
+//! - **Body size cap.** Responses are streamed and rejected with
+//!   [`Error::ResponseTooLarge`] once the accumulated bytes exceed
+//!   [`DEFAULT_MAX_BODY_BYTES`]. A well-formed discovery document or
+//!   `NodeInfo` payload is a few kilobytes at most; the 64 KiB default
+//!   accommodates unusually verbose extensions while foreclosing
+//!   out-of-memory `DoS`.
+//! - **Redirect policy.** [`recommended_client`] builds a
+//!   [`reqwest::Client`] that follows at most two redirects, all to
+//!   the same origin, matching Mastodon's defaults and neutralising
+//!   cross-origin redirect attacks on the endpoint.
 
-use reqwest::{Client, header};
+use reqwest::redirect::Policy;
+use reqwest::{Client, ClientBuilder, header};
 use tracing::debug;
 use url::Url;
 
 use crate::{Discovery, Error, NodeInfo, Version};
 
-/// Fetches the `/.well-known/nodeinfo` discovery document from `host`.
+/// Default hard cap on the response body we will read from a
+/// `NodeInfo` endpoint.
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024;
+
+/// Builds a [`reqwest::Client`] pre-configured for safe `NodeInfo`
+/// resolution.
+///
+/// The returned client uses a strict redirect policy — at most two
+/// redirects, all to the same origin — which matches Mastodon's
+/// defaults and neutralises cross-origin redirect attacks on the
+/// endpoint.
+///
+/// # Errors
+///
+/// Returns [`Error::Http`] if the underlying TLS stack cannot be
+/// initialised.
+pub fn recommended_client() -> Result<Client, Error> {
+    Ok(ClientBuilder::new()
+        .redirect(Policy::custom(|attempt| {
+            const MAX_REDIRECTS: usize = 2;
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error("too many redirects");
+            }
+            let origin = attempt.previous().first().unwrap_or_else(|| attempt.url());
+            if origin.host_str() == attempt.url().host_str()
+                && origin.scheme() == attempt.url().scheme()
+            {
+                attempt.follow()
+            } else {
+                attempt.error("cross-origin redirect forbidden for NodeInfo")
+            }
+        }))
+        .build()?)
+}
+
+/// Fetches the `/.well-known/nodeinfo` discovery document from `host`,
+/// enforcing [`DEFAULT_MAX_BODY_BYTES`] as the body size cap.
 ///
 /// `host` should be a full base URL (including scheme), e.g.
-/// `https://mastodon.social`.
+/// `https://mastodon.social`. Pass a client obtained from
+/// [`recommended_client`] to also benefit from the same-origin
+/// redirect policy.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidUrl`] if `host` cannot be joined with the
-/// well-known path, [`Error::Http`] for network failures, and
-/// [`Error::BadStatus`] / [`Error::Json`] for invalid responses.
+/// well-known path, [`Error::Http`] for network failures,
+/// [`Error::BadStatus`] for non-2xx responses,
+/// [`Error::ResponseTooLarge`] when the body exceeds the cap, and
+/// [`Error::Json`] if the body is not valid JSON.
 pub async fn fetch_discovery(host: &Url, client: &Client) -> Result<Discovery, Error> {
-    let url = host.join(crate::WELL_KNOWN_PATH)?;
-    debug!(%url, "fetching NodeInfo discovery");
+    fetch_discovery_with_limit(host, client, DEFAULT_MAX_BODY_BYTES).await
+}
 
+/// [`fetch_discovery`] variant accepting an explicit body size cap.
+///
+/// # Errors
+///
+/// Same as [`fetch_discovery`].
+pub async fn fetch_discovery_with_limit(
+    host: &Url,
+    client: &Client,
+    max_body_bytes: u64,
+) -> Result<Discovery, Error> {
+    let url = host.join(crate::WELL_KNOWN_PATH)?;
+    debug!(%url, max_body_bytes, "fetching NodeInfo discovery");
+
+    let body = request_capped(client, url, max_body_bytes).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+/// Fetches a [`NodeInfo`] document at `version` from `host`.
+///
+/// Resolves the concrete schema URL via the discovery document and
+/// then fetches and parses the `NodeInfo` JSON, enforcing
+/// [`DEFAULT_MAX_BODY_BYTES`] on both requests.
+///
+/// # Errors
+///
+/// Returns [`Error::VersionNotAdvertised`] if the server does not
+/// advertise the requested version, and propagates transport / parse
+/// errors via [`Error::Http`] / [`Error::Json`] / [`Error::BadStatus`]
+/// / [`Error::ResponseTooLarge`].
+pub async fn fetch(host: &Url, version: Version, client: &Client) -> Result<NodeInfo, Error> {
+    fetch_with_limit(host, version, client, DEFAULT_MAX_BODY_BYTES).await
+}
+
+/// [`fetch`] variant accepting an explicit body size cap.
+///
+/// # Errors
+///
+/// Same as [`fetch`].
+pub async fn fetch_with_limit(
+    host: &Url,
+    version: Version,
+    client: &Client,
+    max_body_bytes: u64,
+) -> Result<NodeInfo, Error> {
+    let discovery = fetch_discovery_with_limit(host, client, max_body_bytes).await?;
+    let link = discovery
+        .find_link(version)
+        .ok_or(Error::VersionNotAdvertised {
+            requested: version.as_str(),
+        })?;
+
+    debug!(url = %link.href, max_body_bytes, "fetching NodeInfo document");
+
+    let body = request_capped(client, link.href.clone(), max_body_bytes).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn request_capped(client: &Client, url: Url, max_body_bytes: u64) -> Result<Vec<u8>, Error> {
     let response = client
         .get(url)
         .header(header::ACCEPT, "application/json")
@@ -31,41 +147,21 @@ pub async fn fetch_discovery(host: &Url, client: &Client) -> Result<Discovery, E
         return Err(Error::BadStatus(status.as_u16()));
     }
 
-    Ok(response.json::<Discovery>().await?)
+    read_capped(response, max_body_bytes).await
 }
 
-/// Fetches a [`NodeInfo`] document at `version` from `host`.
-///
-/// Resolves the concrete schema URL via the discovery document and then
-/// fetches and parses the `NodeInfo` JSON.
-///
-/// # Errors
-///
-/// Returns [`Error::VersionNotAdvertised`] if the server does not advertise
-/// the requested version, and propagates transport / parse errors via
-/// [`Error::Http`] / [`Error::Json`] / [`Error::BadStatus`].
-pub async fn fetch(host: &Url, version: Version, client: &Client) -> Result<NodeInfo, Error> {
-    let discovery = fetch_discovery(host, client).await?;
-    let link = discovery
-        .find_link(version)
-        .ok_or(Error::VersionNotAdvertised {
-            requested: version.as_str(),
-        })?;
-
-    debug!(url = %link.href, "fetching NodeInfo document");
-
-    let response = client
-        .get(link.href.clone())
-        .header(header::ACCEPT, "application/json")
-        .send()
-        .await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(Error::BadStatus(status.as_u16()));
+async fn read_capped(
+    mut response: reqwest::Response,
+    max_body_bytes: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut acc: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if max_body_bytes > 0 && (acc.len() as u64 + chunk.len() as u64) > max_body_bytes {
+            return Err(Error::ResponseTooLarge(max_body_bytes));
+        }
+        acc.extend_from_slice(&chunk);
     }
-
-    Ok(response.json::<NodeInfo>().await?)
+    Ok(acc)
 }
 
 #[cfg(test)]
@@ -112,6 +208,59 @@ mod tests {
 
         assert_eq!(info.version, Version::V2_1);
         assert_eq!(info.software.name, "mock-server");
+    }
+
+    #[tokio::test]
+    async fn oversized_discovery_body_is_rejected() {
+        let server = MockServer::start().await;
+        let base: Url = server.uri().parse().unwrap();
+
+        // 128 KiB body — comfortably above the 64 KiB default cap.
+        let padding = "x".repeat(128 * 1024);
+        Mock::given(method("GET"))
+            .and(path("/.well-known/nodeinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(r#"{{"links":[],"padding":"{padding}"}}"#).into_bytes(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let err = fetch_discovery(&base, &client)
+            .await
+            .expect_err("oversized body must be rejected");
+        assert!(matches!(
+            err,
+            Error::ResponseTooLarge(DEFAULT_MAX_BODY_BYTES)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recommended_client_rejects_cross_origin_redirect() {
+        let primary = MockServer::start().await;
+        let attacker = MockServer::start().await;
+
+        // Attacker pretends to serve a well-known NodeInfo discovery
+        // but redirects off-origin. The recommended client's policy
+        // must refuse to follow that hop.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/nodeinfo"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{}/.well-known/nodeinfo", attacker.uri()),
+            ))
+            .mount(&primary)
+            .await;
+
+        let client = recommended_client().expect("client builds");
+        let base: Url = primary.uri().parse().unwrap();
+        // The exact error surface depends on the redirect-policy
+        // message plumbing; the important invariant is that the
+        // fetch does *not* succeed in following the off-origin hop.
+        fetch_discovery(&base, &client)
+            .await
+            .expect_err("cross-origin redirect must fail");
     }
 
     #[tokio::test]

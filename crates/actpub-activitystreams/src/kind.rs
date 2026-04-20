@@ -42,7 +42,7 @@ pub mod actor {
     pub const SERVICE: &str = "Service";
 }
 
-/// Activity vocabulary — the 29 standard activity verbs from
+/// Activity vocabulary — the 28 standard activity verbs from
 /// [Activity Vocabulary](https://www.w3.org/TR/activitystreams-vocabulary/#activity-types).
 pub mod activity {
     /// Accept the `object` activity.

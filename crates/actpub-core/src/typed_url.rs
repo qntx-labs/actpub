@@ -65,14 +65,6 @@ impl<T: Object> ObjectId<T> {
     pub fn into_url(self) -> Url {
         self.url
     }
-
-    /// Re-tags this reference as pointing at a different [`Object`]
-    /// type. Useful when a single document fits two specialised types
-    /// (e.g. a `Person` is also an `Actor`).
-    #[must_use]
-    pub fn cast<U: Object>(self) -> ObjectId<U> {
-        ObjectId::new(self.url)
-    }
 }
 
 impl<T: Object> Clone for ObjectId<T> {
@@ -169,20 +161,6 @@ mod tests {
         }
     }
 
-    struct Person;
-    impl Object for Person {
-        type Wire = serde_json::Value;
-        fn id(&self) -> &Url {
-            unreachable!("phantom marker only")
-        }
-        fn kind(&self) -> &str {
-            "Person"
-        }
-        fn to_wire(&self) -> Self::Wire {
-            unreachable!("phantom marker only")
-        }
-    }
-
     #[test]
     fn serializes_as_bare_url_string() {
         let id: ObjectId<Note> = "https://example.com/n/1".parse().unwrap();
@@ -209,13 +187,6 @@ mod tests {
         set.insert(a);
         assert!(set.contains(&b));
         assert!(!set.contains(&c));
-    }
-
-    #[test]
-    fn cast_changes_marker_but_preserves_url() {
-        let note_id: ObjectId<Note> = "https://example.com/u/1".parse().unwrap();
-        let person_id: ObjectId<Person> = note_id.clone().cast();
-        assert_eq!(note_id.url(), person_id.url());
     }
 
     #[test]

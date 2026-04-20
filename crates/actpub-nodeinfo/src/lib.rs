@@ -43,7 +43,10 @@ mod schema;
 
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
-pub use self::client::{fetch, fetch_discovery};
+pub use self::client::{
+    DEFAULT_MAX_BODY_BYTES, fetch, fetch_discovery, fetch_discovery_with_limit, fetch_with_limit,
+    recommended_client,
+};
 pub use self::discovery::{Discovery, DiscoveryLink, SCHEMA_REL_PREFIX};
 pub use self::error::Error;
 pub use self::schema::{

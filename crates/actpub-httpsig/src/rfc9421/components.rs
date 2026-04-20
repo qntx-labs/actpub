@@ -121,12 +121,14 @@ impl Component {
 /// # Errors
 ///
 /// Returns [`Error::RequiredHeaderAbsent`] when a header reference
-/// cannot be resolved on the request.
+/// cannot be resolved on the request, including the [`http::header::HOST`]
+/// header that [`Component::Authority`] and [`Component::TargetUri`]
+/// depend on when the request URI is in relative form.
 pub(crate) fn canonical_value<B>(component: &Component, req: &Request<B>) -> Result<String, Error> {
     match component {
         Component::Method => Ok(req.method().as_str().to_uppercase()),
-        Component::TargetUri => Ok(target_uri(req)),
-        Component::Authority => Ok(authority(req)),
+        Component::TargetUri => target_uri(req),
+        Component::Authority => authority(req),
         Component::Scheme => Ok(scheme(req)),
         Component::Path => Ok(req.uri().path().to_owned()),
         Component::Query => Ok(query_with_leading_q(req)),
@@ -135,27 +137,31 @@ pub(crate) fn canonical_value<B>(component: &Component, req: &Request<B>) -> Res
     }
 }
 
-fn target_uri<B>(req: &Request<B>) -> String {
+fn target_uri<B>(req: &Request<B>) -> Result<String, Error> {
     let scheme = scheme(req);
-    let authority = authority(req);
+    let authority = authority(req)?;
     let path_and_query = req
         .uri()
         .path_and_query()
         .map_or_else(|| req.uri().path().to_owned(), ToString::to_string);
-    format!("{scheme}://{authority}{path_and_query}")
+    Ok(format!("{scheme}://{authority}{path_and_query}"))
 }
 
-fn authority<B>(req: &Request<B>) -> String {
+fn authority<B>(req: &Request<B>) -> Result<String, Error> {
     // Prefer the URI authority when present (i.e. absolute-form request);
-    // otherwise fall back to the `Host` header per RFC 9421 §2.2.4.
+    // otherwise fall back to the `Host` header per RFC 9421 §2.2.4. If
+    // neither is available we cannot produce a well-formed `@authority`
+    // or `@target-uri`, so report it rather than silently emit an
+    // empty string and let a forged signature slip through.
     if let Some(auth) = req.uri().authority() {
-        return auth.as_str().to_ascii_lowercase();
+        return Ok(auth.as_str().to_ascii_lowercase());
     }
     req.headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_default()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::RequiredHeaderAbsent(http::header::HOST.as_str().to_owned()))
 }
 
 fn scheme<B>(req: &Request<B>) -> String {
@@ -331,6 +337,32 @@ mod tests {
     fn parse_rejects_unknown_derived_component() {
         let err = Component::parse("@future").expect_err("unknown derived");
         assert!(matches!(err, Error::UnsupportedAlgorithm(_)));
+    }
+
+    #[test]
+    fn authority_errors_when_request_has_no_host_and_no_uri_authority() {
+        // Regression: previously produced `""` and silently yielded
+        // `https:///inbox` for `@target-uri`.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/inbox")
+            .body(Vec::<u8>::new())
+            .expect("valid");
+        let err = canonical_value(&Component::Authority, &req)
+            .expect_err("missing authority must surface as an error");
+        assert!(matches!(err, Error::RequiredHeaderAbsent(name) if name == "host"));
+    }
+
+    #[test]
+    fn target_uri_errors_when_request_has_no_host_and_no_uri_authority() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/inbox")
+            .body(Vec::<u8>::new())
+            .expect("valid");
+        let err = canonical_value(&Component::TargetUri, &req)
+            .expect_err("missing authority must propagate through @target-uri");
+        assert!(matches!(err, Error::RequiredHeaderAbsent(_)));
     }
 
     #[test]

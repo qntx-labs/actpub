@@ -4,7 +4,7 @@ use base64ct::{Base64, Encoding};
 use chrono::{DateTime, Utc};
 use http::Request;
 
-use crate::cavage::canonical::{Timestamps, build_signature_base};
+use crate::cavage::canonical::{CavageHeaderSet, Timestamps, build_signature_base};
 use crate::cavage::header::{CavageHeaderParams, SIGNATURE_HEADER};
 use crate::error::Error;
 use crate::key::{Algorithm, VerifyingKey};
@@ -81,6 +81,12 @@ where
 
     let params = CavageHeaderParams::parse(raw)?;
 
+    // Enforce the required Cavage header set *before* any crypto
+    // work: a signature that omits `(request-target)` or `host` can be
+    // replayed verbatim against different paths or virtual hosts, so
+    // we reject it at the cheapest possible layer.
+    enforce_required_headers(&params.headers, policy.cavage_required_headers)?;
+
     // Freshness check runs *before* the cryptographic verification so
     // that replayed or expired signatures are rejected without taking a
     // cryptographic-work timing hit.
@@ -118,6 +124,19 @@ where
         algorithm: params.algorithm,
         signature_base: base,
     })
+}
+
+/// Rejects the signature when `signed` is missing any name in
+/// `required`. Names are matched case-insensitively, mirroring how HTTP
+/// headers themselves are handled throughout this crate.
+fn enforce_required_headers(signed: &CavageHeaderSet, required: &[&str]) -> Result<(), Error> {
+    for needed in required {
+        let present = signed.iter().any(|h| h.eq_ignore_ascii_case(needed));
+        if !present {
+            return Err(Error::RequiredHeaderAbsent((*needed).to_owned()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -222,6 +241,40 @@ mod tests {
         let err =
             cavage_verify(&req, |_| Err(Error::VerificationFailed)).expect_err("resolver failed");
         assert!(matches!(err, Error::KeyResolution(_)));
+    }
+
+    #[test]
+    fn signature_missing_required_host_header_is_rejected() {
+        // The attacker supplies a valid signature that omits `host`
+        // from the covered header set. A replay against a different
+        // virtual host would succeed without this guard.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = sample_signed_request(&key, b"{}");
+        // Re-sign covering only (request-target) and date — no host.
+        CavageSigner::new(&key, "https://example.com/actors/alice#main-key")
+            .with_headers(["(request-target)", "date"])
+            .sign(&mut req)
+            .expect("sign");
+
+        let err = cavage_verify(&req, |_| Ok(public.clone()))
+            .expect_err("signature without `host` must be rejected");
+        assert!(matches!(err, Error::RequiredHeaderAbsent(name) if name == "host"));
+    }
+
+    #[test]
+    fn signature_missing_required_request_target_is_rejected() {
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = sample_signed_request(&key, b"{}");
+        CavageSigner::new(&key, "kid")
+            .with_headers(["host", "date"])
+            .sign(&mut req)
+            .expect("sign");
+
+        let err = cavage_verify(&req, |_| Ok(public.clone()))
+            .expect_err("signature without `(request-target)` must be rejected");
+        assert!(matches!(err, Error::RequiredHeaderAbsent(name) if name == "(request-target)"));
     }
 
     #[test]

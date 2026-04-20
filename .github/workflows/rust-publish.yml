@@ -12,6 +12,6 @@ jobs:
   call-publish:
     uses: qntx/workflows/.github/workflows/rust-publish.yml@main
     with:
-      package: "actpub-activitystreams actpub-webfinger actpub-nodeinfo actpub-httpsig actpub-federation actpub-axum actpub"
+      package: "actpub-activitystreams actpub-webfinger actpub-nodeinfo actpub-httpsig actpub-core actpub-federation actpub-axum actpub"
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -77,13 +77,13 @@ impl RsaSigningKey {
 
     /// Loads an RSA key pair from a PKCS#8 DER blob.
     ///
-    /// Accepts any 256-bit-aligned modulus width in the
-    /// `2048..=8192` range, matching the backend's
-    /// `RSA_PKCS1_2048_8192_SHA256` verification profile. The lower
-    /// bound is the NIST SP 800-131A minimum and the upper bound is
-    /// the largest key size the backend supports; values outside the
-    /// range are rejected, as are odd widths that cannot represent
-    /// valid RSA moduli.
+    /// Accepts any byte-aligned modulus width in the `2048..=8192`
+    /// range, matching the backend's `RSA_PKCS1_2048_8192_SHA256`
+    /// verification profile. The lower bound is the NIST SP 800-131A
+    /// minimum and the upper bound is the largest key size the backend
+    /// supports; widths outside this range are rejected. Non-standard
+    /// widths like 2304 or 2560 are tolerated because `aws-lc-rs`
+    /// itself accepts them.
     ///
     /// # Errors
     ///
@@ -94,7 +94,7 @@ impl RsaSigningKey {
         let pair =
             RsaKeyPair::from_pkcs8(der).map_err(|e| Error::InvalidPkcs8(format!("RSA: {e}")))?;
         let bits = u32::try_from(pair.public_modulus_len() * 8).unwrap_or(u32::MAX);
-        if !(2048..=8192).contains(&bits) || bits % 256 != 0 {
+        if !(2048..=8192).contains(&bits) {
             return Err(Error::UnsupportedRsaSize(bits));
         }
         Self::build(pair, der.to_vec(), bits)

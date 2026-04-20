@@ -102,6 +102,13 @@ where
         ));
     }
 
+    if !policy.allow_multiple_signatures && inputs.len() > 1 {
+        return Err(Error::MalformedSignatureHeader(format!(
+            "Signature-Input carries {} labels but policy allows only one",
+            inputs.len()
+        )));
+    }
+
     let mut last_err: Option<Error> = None;
     for (label, input) in inputs {
         let Some((_, sig_bytes)) = sigs.iter().find(|(l, _)| l == &label) else {
@@ -131,12 +138,18 @@ where
             }
         };
 
-        if let Some(hint) = input.algorithm.as_deref()
-            && let Some(hinted) = parse_alg_hint(hint)?
-            && hinted != key.algorithm()
-        {
-            last_err = Some(Error::VerificationFailed);
-            continue;
+        if let Some(hint) = input.algorithm.as_deref() {
+            match parse_alg_hint(hint) {
+                Ok(Some(hinted)) if hinted != key.algorithm() => {
+                    last_err = Some(Error::VerificationFailed);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
         }
 
         let inner_list = input.serialise_inner_list();
@@ -171,7 +184,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::digest::sha256_digest_header;
+    use crate::content_digest::content_digest_header;
     use crate::key::{RsaBits, SigningKey};
     use crate::rfc9421::sign::Rfc9421Signer;
 
@@ -182,7 +195,7 @@ mod tests {
             .uri("https://example.com/inbox?a=1")
             .header("host", "example.com")
             .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
-            .header("digest", sha256_digest_header(body))
+            .header("content-digest", content_digest_header(body))
             .body(body.to_vec())
             .expect("valid");
         Rfc9421Signer::new(key, "https://example.com/actor#sig")
@@ -261,5 +274,94 @@ mod tests {
         let err = rfc9421_verify(&req, |_| panic!("resolver must not be called"))
             .expect_err("missing signature");
         assert!(matches!(err, Error::MissingHeader(SIGNATURE_HEADER)));
+    }
+
+    #[test]
+    fn multi_label_signature_input_is_rejected_by_default() {
+        // Mastodon and the RFC 9421 interop profile both expect a
+        // single label; attaching a second one opens a fallback an
+        // attacker can exploit to bypass policy.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = signed_request(&key);
+        // Append a second, empty inner list to produce `sig1=(...), attacker=()`.
+        let input_raw = req
+            .headers()
+            .get(SIGNATURE_INPUT_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+            + r", attacker=()";
+        req.headers_mut()
+            .insert(SIGNATURE_INPUT_HEADER, input_raw.parse().unwrap());
+
+        let err = rfc9421_verify(&req, |_| Ok(public.clone()))
+            .expect_err("multiple labels must be rejected");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
+    }
+
+    #[test]
+    fn multi_label_signature_input_is_accepted_when_policy_allows_it() {
+        // Interop escape hatch: some research / middle-box setups do
+        // attach multiple signatures. Flipping the policy knob must
+        // restore the historical tolerant behaviour.
+        use chrono::DateTime;
+
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = signed_request(&key);
+        let input_raw = req
+            .headers()
+            .get(SIGNATURE_INPUT_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+            + r", attacker=()";
+        req.headers_mut()
+            .insert(SIGNATURE_INPUT_HEADER, input_raw.parse().unwrap());
+
+        let policy = VerifyPolicy {
+            allow_multiple_signatures: true,
+            ..VerifyPolicy::no_freshness_check()
+        };
+        rfc9421_verify_with_policy(
+            &req,
+            &policy,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            |_| Ok(public.clone()),
+        )
+        .expect("the valid sig1 label must still verify");
+    }
+
+    #[test]
+    fn unknown_alg_hint_does_not_short_circuit_multi_label_verification() {
+        // Regression for the `?` short-circuit bug: when an earlier
+        // label carries an unrecognised `alg=` parameter the verifier
+        // must skip it and keep trying later labels, not abort the
+        // entire function.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = signed_request(&key);
+
+        // Tamper the produced Signature-Input header to claim an
+        // unknown algorithm for the single present label. The
+        // resolver still returns a valid key; prior to the fix the
+        // `?` on `parse_alg_hint` bubbled `UnsupportedAlgorithm` out
+        // of the function.
+        let input_raw = req
+            .headers()
+            .get(SIGNATURE_INPUT_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace(r#"alg="ed25519""#, r#"alg="bogus-alg""#);
+        req.headers_mut()
+            .insert(SIGNATURE_INPUT_HEADER, input_raw.parse().unwrap());
+
+        let err = rfc9421_verify(&req, |_| Ok(public.clone()))
+            .expect_err("unknown alg hint must surface as the last recorded error");
+        assert!(matches!(err, Error::UnsupportedAlgorithm(_)));
     }
 }
