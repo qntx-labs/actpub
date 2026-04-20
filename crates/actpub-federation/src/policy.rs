@@ -108,9 +108,9 @@ impl UrlPolicy {
             ));
         }
 
-        let host = url.host().ok_or_else(|| {
-            violation(url, "URL has no host component".to_owned())
-        })?;
+        let host = url
+            .host()
+            .ok_or_else(|| violation(url, "URL has no host component".to_owned()))?;
 
         if self.forbid_ip_literals && matches!(host, Host::Ipv4(_) | Host::Ipv6(_)) {
             return Err(violation(
@@ -120,19 +120,20 @@ impl UrlPolicy {
         }
 
         if self.forbid_loopback_hosts
-            && let Host::Domain(name) = &host {
-                let lower = name.to_ascii_lowercase();
-                #[allow(
-                    clippy::case_sensitive_file_extension_comparisons,
-                    reason = "`.local` is the mDNS link-local suffix, not a file extension; clippy's suggestion to detour through `std::path::Path::extension` would obscure intent and miss bare `localhost` cases"
-                )]
-                if lower == "localhost" || lower.ends_with(".local") {
-                    return Err(violation(
-                        url,
-                        format!("loopback host `{name}` is forbidden (SSRF guard)"),
-                    ));
-                }
+            && let Host::Domain(name) = &host
+        {
+            let lower = name.to_ascii_lowercase();
+            #[allow(
+                clippy::case_sensitive_file_extension_comparisons,
+                reason = "`.local` is the mDNS link-local suffix, not a file extension; clippy's suggestion to detour through `std::path::Path::extension` would obscure intent and miss bare `localhost` cases"
+            )]
+            if lower == "localhost" || lower.ends_with(".local") {
+                return Err(violation(
+                    url,
+                    format!("loopback host `{name}` is forbidden (SSRF guard)"),
+                ));
             }
+        }
 
         let host_str = host.to_string();
         if self.deny_hosts.iter().any(|h| h == &host_str) {
@@ -235,7 +236,9 @@ mod tests {
             deny_hosts: vec!["bad.example".to_owned()],
             ..UrlPolicy::default()
         };
-        let err = p.check(&url("https://bad.example/")).expect_err("denied host");
+        let err = p
+            .check(&url("https://bad.example/"))
+            .expect_err("denied host");
         let Error::PolicyViolation { reason, .. } = &err else {
             panic!("wrong variant: {err:?}");
         };

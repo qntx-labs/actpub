@@ -37,10 +37,10 @@ pub const DEFAULT_CACHE_CAPACITY: u64 = 1024;
 /// Default cache TTL (10 minutes) — short enough that a key rotation
 /// reaches verifiers quickly, long enough that a hot inbox does not
 /// re-fetch the same actor on every delivery.
-pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(10);
 
 /// Default user agent header (`actpub-federation/<version>`).
-#[must_use] 
+#[must_use]
 pub fn default_user_agent() -> String {
     format!("actpub-federation/{}", env!("CARGO_PKG_VERSION"))
 }
@@ -149,7 +149,7 @@ mod tests {
             .request_timeout(Duration::from_secs(30))
             .max_response_bytes(2 << 20)
             .cache_capacity(256)
-            .cache_ttl(Duration::from_secs(60))
+            .cache_ttl(Duration::from_mins(1))
             .signed_fetch(true)
             .build();
 
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
         assert_eq!(cfg.max_response_bytes, 2 << 20);
         assert_eq!(cfg.cache_capacity, 256);
-        assert_eq!(cfg.cache_ttl, Duration::from_secs(60));
+        assert_eq!(cfg.cache_ttl, Duration::from_mins(1));
         assert!(cfg.signed_fetch);
     }
 
