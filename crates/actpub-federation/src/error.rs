@@ -94,4 +94,10 @@ pub enum Error {
     /// returned an error.
     #[error("activity handler failed: {0}")]
     HandlerFailed(String),
+
+    /// A federation actor returned by [`Fetcher`](crate::Fetcher)
+    /// did not expose an `inbox` (and no `endpoints.sharedInbox`),
+    /// so [`Outbox`](crate::Outbox) cannot deliver to it.
+    #[error("actor `{0}` has no `inbox` or `sharedInbox` endpoint")]
+    ActorWithoutInbox(String),
 }

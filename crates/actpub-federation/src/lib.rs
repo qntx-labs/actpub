@@ -38,6 +38,7 @@ mod deliver;
 mod error;
 mod fetcher;
 mod inbox;
+mod outbox;
 mod policy;
 mod retry;
 
@@ -69,6 +70,7 @@ pub use self::fetcher::{
     signed_fetch_signature_header,
 };
 pub use self::inbox::{ActivityHandler, InboxOutcome, InboxPipeline};
+pub use self::outbox::Outbox;
 pub use self::policy::UrlPolicy;
 pub use self::retry::RetryPolicy;
 
