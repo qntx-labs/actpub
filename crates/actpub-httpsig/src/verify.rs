@@ -172,4 +172,54 @@ mod tests {
             verify(&req, |_| panic!("resolver must not be called")).expect_err("unsigned request");
         assert!(matches!(err, Error::MissingHeader(_)));
     }
+
+    #[test]
+    fn policy_rejects_cavage_signature_older_than_max_age() {
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = base_request(b"{}");
+        CavageSigner::new(&key, "kid")
+            .with_created(1_700_000_000)
+            .sign(&mut req)
+            .expect("sign");
+
+        // `now` is 20 hours ahead of `created` — well beyond Mastodon's 12h window.
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000 + 20 * 3600, 0).expect("valid");
+        let err = verify_with_policy(&req, &VerifyPolicy::mastodon(), now, |_| Ok(public.clone()))
+            .expect_err("stale signature must be rejected");
+        assert!(matches!(err, Error::TimestampTooOld { .. }));
+    }
+
+    #[test]
+    fn policy_rejects_rfc9421_signature_in_the_future() {
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = base_request(b"{}");
+        // Future `created` — 15 minutes ahead of our `now`.
+        Rfc9421Signer::new(&key, "kid")
+            .with_created(1_700_000_000 + 15 * 60)
+            .sign(&mut req)
+            .expect("sign");
+
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid");
+        let err = verify_with_policy(&req, &VerifyPolicy::mastodon(), now, |_| Ok(public.clone()))
+            .expect_err("future-dated signature must be rejected");
+        assert!(matches!(err, Error::TimestampInFuture { .. }));
+    }
+
+    #[test]
+    fn policy_accepts_signature_within_skew_tolerance() {
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let mut req = base_request(b"{}");
+        // 1 minute into the future — within the Mastodon 5-minute skew window.
+        Rfc9421Signer::new(&key, "kid")
+            .with_created(1_700_000_000 + 60)
+            .sign(&mut req)
+            .expect("sign");
+
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid");
+        verify_with_policy(&req, &VerifyPolicy::mastodon(), now, |_| Ok(public.clone()))
+            .expect("signature within skew tolerance must verify");
+    }
 }

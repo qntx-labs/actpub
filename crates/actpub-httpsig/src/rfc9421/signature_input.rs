@@ -51,6 +51,65 @@ pub struct SignatureInput {
 }
 
 impl SignatureInput {
+    /// Creates a [`SignatureInput`] covering the given components, with
+    /// every optional parameter left unset. Use the `with_*` builders
+    /// below to populate `keyid`, `created`, `expires`, `nonce` and
+    /// `tag` as needed.
+    #[must_use]
+    pub const fn new(components: Vec<Component>) -> Self {
+        Self {
+            components,
+            keyid: None,
+            algorithm: None,
+            created: None,
+            expires: None,
+            nonce: None,
+            tag: None,
+        }
+    }
+
+    /// Sets the `keyid=` parameter.
+    #[must_use]
+    pub fn with_keyid(mut self, keyid: impl Into<String>) -> Self {
+        self.keyid = Some(keyid.into());
+        self
+    }
+
+    /// Sets the `alg=` parameter.
+    #[must_use]
+    pub fn with_algorithm(mut self, algorithm: impl Into<String>) -> Self {
+        self.algorithm = Some(algorithm.into());
+        self
+    }
+
+    /// Sets the `created=` parameter (seconds since UNIX epoch).
+    #[must_use]
+    pub const fn with_created(mut self, created: i64) -> Self {
+        self.created = Some(created);
+        self
+    }
+
+    /// Sets the `expires=` parameter (seconds since UNIX epoch).
+    #[must_use]
+    pub const fn with_expires(mut self, expires: i64) -> Self {
+        self.expires = Some(expires);
+        self
+    }
+
+    /// Sets the `nonce=` parameter.
+    #[must_use]
+    pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Some(nonce.into());
+        self
+    }
+
+    /// Sets the `tag=` parameter.
+    #[must_use]
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
     /// Serialises this entry as the inner-list-with-parameters portion
     /// that appears after `label=`. The full header value is built by
     /// [`serialise_signature_input_dict`].
@@ -75,13 +134,12 @@ impl SignatureInput {
             out.push_str(&c.lexical());
         }
         out.push(')');
+        // Parameter order matches RFC 9421 §2.3 (and the order observed
+        // in the Appendix B test vectors): created, expires, nonce,
+        // alg, keyid, tag. Wire-compatible verifiers treat the
+        // dictionary as order-insensitive, but matching the RFC makes
+        // byte-level conformance tests pass out of the box.
         let infallible = "writing to an owned String is infallible";
-        if let Some(keyid) = &self.keyid {
-            write!(out, r#";keyid="{keyid}""#).expect(infallible);
-        }
-        if let Some(alg) = &self.algorithm {
-            write!(out, r#";alg="{alg}""#).expect(infallible);
-        }
         if let Some(c) = self.created {
             write!(out, ";created={c}").expect(infallible);
         }
@@ -90,6 +148,12 @@ impl SignatureInput {
         }
         if let Some(n) = &self.nonce {
             write!(out, r#";nonce="{n}""#).expect(infallible);
+        }
+        if let Some(alg) = &self.algorithm {
+            write!(out, r#";alg="{alg}""#).expect(infallible);
+        }
+        if let Some(keyid) = &self.keyid {
+            write!(out, r#";keyid="{keyid}""#).expect(infallible);
         }
         if let Some(t) = &self.tag {
             write!(out, r#";tag="{t}""#).expect(infallible);
@@ -217,38 +281,32 @@ mod tests {
 
     #[test]
     fn serialise_matches_rfc9421_example() {
-        let input = SignatureInput {
-            components: vec![
-                Component::Method,
-                Component::TargetUri,
-                Component::Header("host".into()),
-                Component::Header("date".into()),
-            ],
-            keyid: Some("test-key-rsa".into()),
-            algorithm: None,
-            created: Some(1_618_884_473),
-            expires: None,
-            nonce: None,
-            tag: None,
-        };
+        // Parameter order mirrors the RFC 9421 Appendix B conventions:
+        // `created` before `keyid`.
+        let input = SignatureInput::new(vec![
+            Component::Method,
+            Component::TargetUri,
+            Component::Header("host".into()),
+            Component::Header("date".into()),
+        ])
+        .with_keyid("test-key-rsa")
+        .with_created(1_618_884_473);
         let dict = serialise_signature_input_dict(&[("sig1".into(), input)]);
         assert_eq!(
             dict,
-            r#"sig1=("@method" "@target-uri" "host" "date");keyid="test-key-rsa";created=1618884473"#,
+            r#"sig1=("@method" "@target-uri" "host" "date");created=1618884473;keyid="test-key-rsa""#,
         );
     }
 
     #[test]
     fn parse_roundtrips_through_serialise() {
-        let input = SignatureInput {
-            components: vec![Component::Method, Component::Authority],
-            keyid: Some("kid".into()),
-            algorithm: Some("ed25519".into()),
-            created: Some(1_700_000_000),
-            expires: Some(1_700_000_600),
-            nonce: Some("abc".into()),
-            tag: Some("mastodon".into()),
-        };
+        let input = SignatureInput::new(vec![Component::Method, Component::Authority])
+            .with_keyid("kid")
+            .with_algorithm("ed25519")
+            .with_created(1_700_000_000)
+            .with_expires(1_700_000_600)
+            .with_nonce("abc")
+            .with_tag("mastodon");
         let wire = serialise_signature_input_dict(&[("sig".into(), input.clone())]);
         let parsed = parse_signature_input_dict(&wire).expect("parse");
         assert_eq!(parsed.len(), 1);
