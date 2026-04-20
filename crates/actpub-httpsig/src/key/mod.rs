@@ -45,18 +45,22 @@ impl Algorithm {
         }
     }
 
-    /// Parses a Cavage-compatible name back into an [`Algorithm`].
+    /// Parses a Cavage / RFC 9421-compatible name back into an
+    /// [`Algorithm`].
     ///
-    /// Accepts the canonical lowercase names and — for robustness — the
-    /// legacy `hs2019` name Mastodon occasionally emits, treating it as a
-    /// request to auto-detect the algorithm from the key itself.
+    /// Accepts both naming conventions in use across the Fediverse:
+    ///
+    /// - Cavage draft-12 `rsa-sha256`, `ed25519`, `ed25519-sha512`
+    /// - RFC 9421 §3.3.2 `rsa-v1_5-sha256`
+    /// - Legacy `hs2019` (Mastodon), which requests auto-detection
+    ///   from the key itself — returned as `Ok(None)`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedAlgorithm`] for anything else.
     pub fn parse(name: &str) -> Result<Option<Self>, Error> {
         match name {
-            "rsa-sha256" => Ok(Some(Self::RsaSha256)),
+            "rsa-sha256" | "rsa-v1_5-sha256" => Ok(Some(Self::RsaSha256)),
             "ed25519" | "ed25519-sha512" => Ok(Some(Self::Ed25519)),
             "hs2019" => Ok(None),
             other => Err(Error::UnsupportedAlgorithm(other.to_owned())),
@@ -276,8 +280,17 @@ mod tests {
             Algorithm::parse("rsa-sha256").expect("parse"),
             Some(Algorithm::RsaSha256),
         );
+        // RFC 9421 §3.3.2 name for the same primitive.
+        assert_eq!(
+            Algorithm::parse("rsa-v1_5-sha256").expect("parse"),
+            Some(Algorithm::RsaSha256),
+        );
         assert_eq!(
             Algorithm::parse("ed25519").expect("parse"),
+            Some(Algorithm::Ed25519),
+        );
+        assert_eq!(
+            Algorithm::parse("ed25519-sha512").expect("parse"),
             Some(Algorithm::Ed25519),
         );
         // Legacy `hs2019` requests autodetection.

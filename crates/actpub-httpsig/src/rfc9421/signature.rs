@@ -10,7 +10,7 @@
 //! Each label corresponds one-to-one with a label in the paired
 //! `Signature-Input:` header. Callers must look up both when verifying.
 
-use sfv::{BareItem, Dictionary, Item, ListEntry, Parser, SerializeValue};
+use sfv::{BareItem, Dictionary, FieldType, Item, Key, ListEntry, Parser};
 
 use crate::error::Error;
 
@@ -28,10 +28,13 @@ pub const SIGNATURE_HEADER: &str = "signature";
 /// [`Error::MalformedSignatureHeader`] if any entry is not a byte-seq
 /// item.
 pub fn parse_signature_dict(raw: &str) -> Result<Vec<(String, Vec<u8>)>, Error> {
-    let dict = Parser::parse_dictionary(raw.as_bytes()).map_err(|e| Error::InvalidHeader {
-        name: SIGNATURE_HEADER,
-        reason: e.to_owned(),
-    })?;
+    let dict: Dictionary =
+        Parser::new(raw)
+            .parse()
+            .map_err(|e: sfv::Error| Error::InvalidHeader {
+                name: SIGNATURE_HEADER,
+                reason: e.to_string(),
+            })?;
 
     let mut out = Vec::with_capacity(dict.len());
     for (label, entry) in dict {
@@ -43,12 +46,12 @@ pub fn parse_signature_dict(raw: &str) -> Result<Vec<(String, Vec<u8>)>, Error> 
                 )));
             }
         };
-        let BareItem::ByteSeq(bytes) = item.bare_item else {
+        let BareItem::ByteSequence(bytes) = item.bare_item else {
             return Err(Error::MalformedSignatureHeader(format!(
                 "entry `{label}` must be a byte sequence"
             )));
         };
-        out.push((label, bytes));
+        out.push((label.into(), bytes));
     }
 
     Ok(out)
@@ -59,23 +62,24 @@ pub fn parse_signature_dict(raw: &str) -> Result<Vec<(String, Vec<u8>)>, Error> 
 ///
 /// # Panics
 ///
-/// Panics only if `sfv` fails to serialise an all-ByteSeq dictionary,
-/// which is unreachable for the inputs we construct.
+/// Panics only if a label fails sf-key validation, or if `sfv` fails to
+/// serialise an all-byte-sequence dictionary. Both are unreachable for
+/// the inputs this crate constructs.
 #[must_use]
 #[allow(
     clippy::expect_used,
-    reason = "serialising an all-ByteSeq dictionary cannot fail"
+    reason = "serialising an all-byte-sequence dictionary under validated keys cannot fail"
 )]
 pub fn serialise_signature_dict(entries: &[(String, Vec<u8>)]) -> String {
     let mut dict = Dictionary::new();
     for (label, bytes) in entries {
+        let key = Key::try_from(label.clone()).expect("signature label must be a valid sf-key");
         dict.insert(
-            label.clone(),
-            ListEntry::Item(Item::new(BareItem::ByteSeq(bytes.clone()))),
+            key,
+            ListEntry::Item(Item::new(BareItem::ByteSequence(bytes.clone()))),
         );
     }
-    dict.serialize_value()
-        .expect("ByteSeq dictionary is always serialisable")
+    FieldType::serialize(&dict).expect("byte-sequence dictionary is always serialisable")
 }
 
 #[cfg(test)]

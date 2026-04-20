@@ -1,29 +1,96 @@
 //! Asynchronous `WebFinger` client built on [`reqwest`].
+//!
+//! # Security considerations
+//!
+//! The Fediverse `WebFinger` responder is untrusted by definition,
+//! so this client enforces three hardening guard-rails on every
+//! response:
+//!
+//! - **Body size cap.** Responses are streamed and rejected with
+//!   [`Error::ResponseTooLarge`] once the accumulated bytes exceed
+//!   [`DEFAULT_MAX_BODY_BYTES`]. A well-behaved `WebFinger` JRD is
+//!   a few hundred bytes; the 64 KiB default leaves ample room for
+//!   exotic extensions while foreclosing out-of-memory `DoS`.
+//! - **Redirect policy.** When the caller obtains their
+//!   [`reqwest::Client`] from [`recommended_client`], the client is
+//!   pre-configured with a strict policy: at most two redirects
+//!   and only to the same origin. This matches Mastodon's
+//!   defaults and neutralises cross-origin redirect attacks on
+//!   the `WebFinger` endpoint.
+//! - **Subject verification.** [`resolve`] requires the returned
+//!   JRD subject (or one of its aliases) to equal the requested
+//!   resource; a misconfigured or malicious responder cannot swap
+//!   identities under the caller's feet.
 
-use reqwest::{Client, header};
+use reqwest::redirect::Policy;
+use reqwest::{Client, ClientBuilder, header};
 use tracing::debug;
 use url::Url;
 
 use crate::{Account, Error, Jrd};
 
-/// Resolves a Fediverse [`Account`] to its [`Jrd`] via `WebFinger`.
+/// Default hard cap on the response body we will read from a
+/// `WebFinger` endpoint.
 ///
-/// This performs an HTTPS `GET` against the account's `/.well-known/webfinger`
-/// endpoint with the correct `Accept` header, verifies the returned
-/// `subject` matches the requested resource (to defend against
-/// misconfigured servers returning data for a different account), and then
-/// returns the parsed JRD.
+/// `WebFinger` JRDs in the wild are rarely larger than 2 KiB; 64 KiB
+/// is a deliberately generous ceiling that still bounds memory use
+/// against a hostile responder.
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024;
+
+/// Builds a [`reqwest::Client`] pre-configured for safe `WebFinger`
+/// resolution.
 ///
-/// This is a convenience wrapper over [`fetch_at`] that delegates URL
-/// construction to [`Account::webfinger_url`] and uses the account's
-/// canonical `acct:` resource as the expected subject.
+/// The returned client uses a strict redirect policy — at most two
+/// redirects, all to the same origin — which matches Mastodon's
+/// defaults and neutralises cross-origin redirect attacks on the
+/// endpoint. Callers that need custom behaviour (e.g. a shared
+/// connection pool) can reuse the returned client or construct
+/// their own and pass it to [`resolve`] / [`fetch_at`] directly.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Http`] for network failures, [`Error::BadStatus`] for
-/// non-2xx responses, [`Error::SubjectMismatch`] if the returned JRD's
-/// subject does not match the request, and [`Error::Json`] if the body is
-/// not valid JSON.
+/// Returns [`Error::Http`] if the underlying TLS stack cannot be
+/// initialised.
+pub fn recommended_client() -> Result<Client, Error> {
+    Ok(ClientBuilder::new()
+        .redirect(Policy::custom(|attempt| {
+            const MAX_REDIRECTS: usize = 2;
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error("too many redirects");
+            }
+            let origin = attempt.previous().first().unwrap_or_else(|| attempt.url());
+            if origin.host_str() == attempt.url().host_str()
+                && origin.scheme() == attempt.url().scheme()
+            {
+                attempt.follow()
+            } else {
+                attempt.error("cross-origin redirect forbidden for WebFinger")
+            }
+        }))
+        .build()?)
+}
+
+/// Resolves a Fediverse [`Account`] to its [`Jrd`] via `WebFinger`.
+///
+/// This performs an HTTPS `GET` against the account's
+/// `/.well-known/webfinger` endpoint with the correct `Accept`
+/// header, verifies the returned `subject` matches the requested
+/// resource (to defend against misconfigured servers returning
+/// data for a different account), and then returns the parsed JRD.
+///
+/// Internally delegates to [`fetch_at`] with the canonical `acct:`
+/// resource and [`DEFAULT_MAX_BODY_BYTES`] size cap. Pass in a
+/// client obtained from [`recommended_client`] to also benefit
+/// from the same-origin redirect policy.
+///
+/// # Errors
+///
+/// Returns [`Error::Http`] for network failures,
+/// [`Error::BadStatus`] for non-2xx responses,
+/// [`Error::ResponseTooLarge`] if the server sends more than
+/// [`DEFAULT_MAX_BODY_BYTES`], [`Error::SubjectMismatch`] if the
+/// returned JRD's subject does not match the request, and
+/// [`Error::Json`] if the body is not valid JSON.
 pub async fn resolve(account: &Account, client: &Client) -> Result<Jrd, Error> {
     let url = account.webfinger_url()?;
     let expected = account.to_resource();
@@ -60,7 +127,26 @@ pub async fn fetch_at(
     expected_subject: Option<&str>,
     client: &Client,
 ) -> Result<Jrd, Error> {
-    debug!(%url, "fetching WebFinger JRD");
+    fetch_at_with_limit(url, expected_subject, client, DEFAULT_MAX_BODY_BYTES).await
+}
+
+/// [`fetch_at`] variant that accepts an explicit body size cap.
+///
+/// Useful when the caller has a stricter deployment budget than
+/// [`DEFAULT_MAX_BODY_BYTES`] (or, rarely, a looser one). Set
+/// `max_body_bytes` to `0` to disable the cap — **not** recommended
+/// outside trusted-network contexts.
+///
+/// # Errors
+///
+/// Same as [`fetch_at`].
+pub async fn fetch_at_with_limit(
+    url: &Url,
+    expected_subject: Option<&str>,
+    client: &Client,
+    max_body_bytes: u64,
+) -> Result<Jrd, Error> {
+    debug!(%url, max_body_bytes, "fetching WebFinger JRD");
 
     let response = client
         .get(url.clone())
@@ -76,10 +162,12 @@ pub async fn fetch_at(
         return Err(Error::BadStatus(status.as_u16()));
     }
 
-    // The response body is parsed as JSON regardless of Content-Type.
-    // RFC 7033 specifies `application/jrd+json` but Fediverse servers in
-    // the wild very often serve `application/json`; both are accepted.
-    let jrd: Jrd = response.json().await?;
+    // Stream the body under an explicit cap. RFC 7033 specifies
+    // `application/jrd+json` but Fediverse servers very often serve
+    // `application/json`; we do not reject either Content-Type, but
+    // we do reject a body that grows past `max_body_bytes`.
+    let body = read_capped(response, max_body_bytes).await?;
+    let jrd: Jrd = serde_json::from_slice(&body)?;
 
     if jrd.subject.is_empty() {
         return Err(Error::MissingSubject);
@@ -96,6 +184,24 @@ pub async fn fetch_at(
     }
 
     Ok(jrd)
+}
+
+/// Reads `response`'s body into a [`Vec<u8>`], aborting with
+/// [`Error::ResponseTooLarge`] as soon as the accumulated length
+/// would exceed `max_body_bytes`. A `max_body_bytes` of `0`
+/// disables the cap (useful for trusted-network tests).
+async fn read_capped(
+    mut response: reqwest::Response,
+    max_body_bytes: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut acc: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if max_body_bytes > 0 && (acc.len() as u64 + chunk.len() as u64) > max_body_bytes {
+            return Err(Error::ResponseTooLarge(max_body_bytes));
+        }
+        acc.extend_from_slice(&chunk);
+    }
+    Ok(acc)
 }
 
 #[cfg(test)]
@@ -289,5 +395,65 @@ mod tests {
             .parse()
             .expect("valid URL");
         assert_send(fetch_at(&url, None, &client));
+    }
+
+    #[tokio::test]
+    async fn fetch_at_rejects_body_exceeding_size_cap() {
+        // Defence against OOM-by-JSON: a hostile responder could
+        // stream gigabytes under `application/json`. We stop reading
+        // the moment the accumulated bytes exceed `max_body_bytes`.
+        let server = MockServer::start().await;
+        let big = "x".repeat(65_536);
+        Mock::given(method("GET"))
+            .and(path("/.well-known/webfinger"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(r#"{{"subject":"acct:a@b.example","padding":"{big}"}}"#).into_bytes(),
+                "application/jrd+json",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = fetch_at_with_limit(
+            &mock_url(&server, "acct:a@b.example"),
+            None,
+            &Client::new(),
+            1024, // 1 KiB cap
+        )
+        .await
+        .expect_err("oversize body must be rejected");
+
+        assert!(
+            matches!(err, Error::ResponseTooLarge(1024)),
+            "expected ResponseTooLarge(1024), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_at_accepts_body_under_the_default_cap() {
+        // Realistic JRD well under 64 KiB passes the default cap
+        // without trouble.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/webfinger"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "subject": "acct:a@b.example",
+                "links": [{"rel": "self", "type": "application/activity+json", "href": "https://b.example/u/a"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let jrd = fetch_at(
+            &mock_url(&server, "acct:a@b.example"),
+            Some("acct:a@b.example"),
+            &Client::new(),
+        )
+        .await
+        .expect("well-sized response must succeed");
+        assert_eq!(jrd.subject, "acct:a@b.example");
+    }
+
+    #[test]
+    fn recommended_client_builds_without_panicking() {
+        let _ = recommended_client().expect("TLS stack must initialise");
     }
 }

@@ -77,16 +77,24 @@ impl RsaSigningKey {
 
     /// Loads an RSA key pair from a PKCS#8 DER blob.
     ///
+    /// Accepts any 256-bit-aligned modulus width in the
+    /// `2048..=8192` range, matching the backend's
+    /// `RSA_PKCS1_2048_8192_SHA256` verification profile. The lower
+    /// bound is the NIST SP 800-131A minimum and the upper bound is
+    /// the largest key size the backend supports; values outside the
+    /// range are rejected, as are odd widths that cannot represent
+    /// valid RSA moduli.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidPkcs8`] if the DER cannot be decoded as an
-    /// RSA `PrivateKeyInfo`, and [`Error::UnsupportedRsaSize`] if the
-    /// resulting modulus is outside the 2048..=4096 supported range.
+    /// Returns [`Error::InvalidPkcs8`] if the DER cannot be decoded
+    /// as an RSA `PrivateKeyInfo`, and [`Error::UnsupportedRsaSize`]
+    /// for any other width.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
         let pair =
             RsaKeyPair::from_pkcs8(der).map_err(|e| Error::InvalidPkcs8(format!("RSA: {e}")))?;
         let bits = u32::try_from(pair.public_modulus_len() * 8).unwrap_or(u32::MAX);
-        if !matches!(bits, 2048 | 4096) {
+        if !(2048..=8192).contains(&bits) || bits % 256 != 0 {
             return Err(Error::UnsupportedRsaSize(bits));
         }
         Self::build(pair, der.to_vec(), bits)

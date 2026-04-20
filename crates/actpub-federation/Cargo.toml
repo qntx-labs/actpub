@@ -30,6 +30,13 @@ httpdate = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 bon = { workspace = true }
 
+[features]
+# Exposes `UrlPolicy::permissive_for_tests` outside of cfg(test).
+# Consumers that only need production policy presets must NOT
+# enable this feature; it is intended purely for integration
+# tests where wiremock / httptest stand in for a real peer.
+test-util = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 wiremock = { workspace = true }

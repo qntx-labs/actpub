@@ -146,19 +146,36 @@ where
 
 /// Maps a federation [`Error`] to the wire-appropriate HTTP status
 /// code.
+///
+/// The mapping follows the Mastodon inbox contract as closely as
+/// the federation error type permits:
+///
+/// - **400 Bad Request** for protocol-level defects in the inbound
+///   document that the sender can fix (malformed JSON, bogus
+///   content-type, body over size).
+/// - **401 Unauthorized** when the HTTP signature verifies against
+///   the wrong key or an actor impersonation is detected
+///   ([`Error::SignerKeyMismatch`]). The sender has a key problem
+///   and must re-sign with correct identity binding.
+/// - **403 Forbidden** when [`UrlPolicy`](actpub_federation::UrlPolicy)
+///   rejects a URL (a federation-level refusal, not a sender bug).
+/// - **422 Unprocessable Entity** when the signing actor is missing
+///   the key our verifier needs.
+/// - **502 Bad Gateway** for upstream fetch failures that are not
+///   the sender's fault.
 const fn status_for(err: &Error) -> StatusCode {
     match err {
         Error::HttpSig(_)
         | Error::Json(_)
         | Error::Cryptosuite(_)
-        | Error::PolicyViolation { .. }
         | Error::ResponseTooLarge { .. }
         | Error::UnexpectedContentType { .. } => StatusCode::BAD_REQUEST,
-        Error::Status { .. } | Error::Http(_) | Error::Timeout { .. } => StatusCode::BAD_GATEWAY,
+        Error::SignerKeyMismatch(_) => StatusCode::UNAUTHORIZED,
+        Error::PolicyViolation { .. } => StatusCode::FORBIDDEN,
         Error::ActorWithoutKey(_) | Error::ActorWithoutInbox(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        Error::Status { .. } | Error::Http(_) | Error::Timeout { .. } => StatusCode::BAD_GATEWAY,
         // `Error` is `#[non_exhaustive]`; HandlerFailed / InvalidUrl
-        // and any future variants we have not yet given explicit
-        // mappings to default to 500.
+        // and any future variants default to 500.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

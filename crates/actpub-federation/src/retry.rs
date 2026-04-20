@@ -91,33 +91,38 @@ impl RetryPolicy {
         }
     }
 
-    /// Returns the wait before the `attempt`-th retry.
+    /// Returns the wait to observe before attempting retry
+    /// number `retries_so_far`.
     ///
-    /// `attempt` is 1-indexed: `delay_before_retry(1)` is the wait
-    /// before the **first** retry (i.e. before the second total
-    /// attempt). `delay_before_retry(0)` is defined to be zero so
-    /// the helper composes naturally with the first immediate
-    /// attempt.
+    /// Semantics, with `retries_so_far` interpreted as "how many
+    /// retries have already failed":
+    ///
+    /// - `0` -> `Duration::ZERO`: the first attempt runs
+    ///   immediately, without delay.
+    /// - `1` -> [`initial_delay`](Self::initial_delay): the wait
+    ///   before the first retry.
+    /// - `N` -> `initial_delay * multiplier^(N-1)` capped at
+    ///   [`max_delay`](Self::max_delay) for any `N >= 1`.
     #[must_use]
-    pub fn delay_before_retry(&self, attempt: u32) -> Duration {
-        if attempt == 0 {
+    pub fn delay_before_retry(&self, retries_so_far: u32) -> Duration {
+        if retries_so_far == 0 {
             return Duration::ZERO;
         }
-        // attempt N → multiplier^(N-1)
+        // retries_so_far N -> multiplier^(N-1)
         let exp = self
             .multiplier
-            .powi(i32::try_from(attempt - 1).unwrap_or(i32::MAX));
+            .powi(i32::try_from(retries_so_far - 1).unwrap_or(i32::MAX));
         let secs = self.initial_delay.as_secs_f64() * exp;
         let capped = secs.min(self.max_delay.as_secs_f64());
         Duration::from_secs_f64(capped.max(0.0))
     }
 
-    /// Returns `true` when the runtime should give up because
-    /// `attempt` has reached or exceeded
+    /// Returns `true` when the runtime should give up because the
+    /// number of retries completed so far has reached or exceeded
     /// [`max_retries`](Self::max_retries).
     #[must_use]
-    pub const fn is_exhausted(&self, attempt: u32) -> bool {
-        attempt >= self.max_retries
+    pub const fn is_exhausted(&self, retries_so_far: u32) -> bool {
+        retries_so_far >= self.max_retries
     }
 }
 

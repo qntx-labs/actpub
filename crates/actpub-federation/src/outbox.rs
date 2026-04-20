@@ -34,6 +34,44 @@ use crate::error::Error;
 use crate::fetcher::Fetcher;
 use crate::retry::RetryPolicy;
 
+/// Outcome of a single [`Outbox::dispatch`] call.
+///
+/// `dispatch` is best-effort: a broken recipient never aborts the
+/// fan-out. The resulting report enumerates how many unique inboxes
+/// were actually enqueued and records (`actor_url`, `error`) pairs
+/// for every recipient whose actor could not be resolved or whose
+/// JSON did not expose a usable inbox.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DispatchReport {
+    /// Number of unique inbox URLs enqueued for background delivery.
+    pub enqueued: usize,
+    /// Per-actor resolution failures. Empty on full success.
+    pub errors: Vec<(Url, Error)>,
+}
+
+impl DispatchReport {
+    /// `true` when every recipient resolved to an enqueued inbox.
+    #[must_use]
+    pub const fn is_full_success(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Outcome of [`Outbox::resolve_inboxes`].
+///
+/// Best-effort counterpart to the older fail-fast API: both the
+/// successful inbox URLs and the per-actor failures are surfaced so
+/// the caller can observe partial success.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct InboxResolution {
+    /// De-duplicated set of inbox URLs that resolved successfully.
+    pub inboxes: HashSet<Url>,
+    /// Per-actor resolution failures in submission order.
+    pub errors: Vec<(Url, Error)>,
+}
+
 /// Send-side counterpart of [`InboxPipeline`](crate::InboxPipeline).
 ///
 /// Cheap to clone (the worker handle, channel sender, and pinned
@@ -121,26 +159,29 @@ where
     /// on the wire in the activity's `to` / `cc` fields. The special
     /// public collection URL
     /// `https://www.w3.org/ns/activitystreams#Public` MUST be filtered
-    /// out by the caller before this call — it is not a real
+    /// out by the caller before this call -- it is not a real
     /// addressable actor.
     ///
-    /// # Errors
+    /// # Best-effort semantics
     ///
-    /// Returns the first [`Error`] produced while fetching one of the
-    /// actors. Callers that want partial delivery (best-effort across
-    /// recipients) should resolve actors themselves and call
-    /// [`enqueue`](Self::enqueue) per inbox.
-    pub async fn dispatch(
-        &self,
-        activity: Value,
-        recipient_actors: &[Url],
-    ) -> Result<usize, Error> {
-        let inboxes = self.resolve_inboxes(recipient_actors).await?;
-        let count = inboxes.len();
-        for inbox in inboxes {
+    /// Actor resolution is best-effort: if one recipient's actor
+    /// cannot be dereferenced or exposes no inbox, the failure is
+    /// recorded in [`DispatchReport::errors`] but all **other**
+    /// recipients continue to be resolved and enqueued. This
+    /// matches how Mastodon / Pleroma / Lemmy all treat a broken
+    /// remote peer -- a single dead recipient never stops the
+    /// fan-out. Callers that want strict fail-fast behaviour can
+    /// check `report.errors.is_empty()` themselves.
+    pub async fn dispatch(&self, activity: Value, recipient_actors: &[Url]) -> DispatchReport {
+        let resolution = self.resolve_inboxes(recipient_actors).await;
+        let enqueued = resolution.inboxes.len();
+        for inbox in resolution.inboxes {
             self.enqueue(activity.clone(), inbox);
         }
-        Ok(count)
+        DispatchReport {
+            enqueued,
+            errors: resolution.errors,
+        }
     }
 
     /// Enqueues a single delivery job — bypassing the actor-to-inbox
@@ -172,18 +213,39 @@ where
     /// URLs, preferring `endpoints.sharedInbox` whenever an actor
     /// publishes one.
     ///
-    /// # Errors
-    ///
-    /// Returns the first fetcher error or
-    /// [`Error::ActorWithoutInbox`].
-    pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> Result<HashSet<Url>, Error> {
-        let mut inboxes: HashSet<Url> = HashSet::new();
+    /// Never returns a top-level `Result`: actor-resolution failures
+    /// are collected into [`InboxResolution::errors`] while every
+    /// other recipient continues to be resolved. This matches the
+    /// best-effort fan-out contract used by every mainstream
+    /// Fediverse server.
+    pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> InboxResolution {
+        let mut resolution = InboxResolution::default();
         for actor_url in recipient_actors {
-            let actor = self.inner.fetcher.fetch_raw(actor_url).await?;
-            let inbox = pick_inbox(&actor, actor_url)?;
-            inboxes.insert(inbox);
+            match self.inner.fetcher.fetch_raw(actor_url).await {
+                Ok(actor) => match pick_inbox(&actor, actor_url) {
+                    Ok(inbox) => {
+                        resolution.inboxes.insert(inbox);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "actpub::outbox",
+                            %actor_url, error = %e,
+                            "recipient has no usable inbox; skipping",
+                        );
+                        resolution.errors.push((actor_url.clone(), e));
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "actpub::outbox",
+                        %actor_url, error = %e,
+                        "failed to fetch recipient actor; skipping",
+                    );
+                    resolution.errors.push((actor_url.clone(), e));
+                }
+            }
         }
-        Ok(inboxes)
+        resolution
     }
 }
 
@@ -412,16 +474,20 @@ mod tests {
         );
 
         let activity = json!({ "id": "https://send.example/a/1", "type": "Create" });
-        let n = outbox
+        let report = outbox
             .dispatch(
                 activity,
                 &[alice_url.parse().unwrap(), bob_url.parse().unwrap()],
             )
-            .await
-            .unwrap();
+            .await;
+        assert!(
+            report.is_full_success(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
         assert_eq!(
-            n, 1,
-            "shared inbox dedupes two recipients into one delivery"
+            report.enqueued, 1,
+            "shared inbox dedupes two recipients into one delivery",
         );
 
         // Give the worker a chance to drain.
@@ -448,13 +514,13 @@ mod tests {
             RetryPolicy::for_tests(),
         );
 
-        outbox
+        let report = outbox
             .dispatch(
                 json!({ "id": "https://send.example/a/2", "type": "Create" }),
                 &[alice_url.parse().unwrap()],
             )
-            .await
-            .unwrap();
+            .await;
+        assert!(report.is_full_success());
 
         // First attempt is immediate, retry waits ~10ms; sleep
         // 200ms to be safe across CI timing jitter.
@@ -481,13 +547,13 @@ mod tests {
             RetryPolicy::for_tests(),
         );
 
-        outbox
+        let report = outbox
             .dispatch(
                 json!({ "id": "https://send.example/a/3", "type": "Create" }),
                 &[alice_url.parse().unwrap()],
             )
-            .await
-            .unwrap();
+            .await;
+        assert!(report.is_full_success());
 
         // for_tests() schedule: 0, 10, 20, 40 ms → total <100 ms.
         // Wait generously to let the worker exhaust retries.
@@ -504,7 +570,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_propagates_actor_without_inbox_error() {
+    async fn dispatch_records_actor_without_inbox_as_partial_failure() {
+        // Best-effort contract: one broken recipient produces a
+        // report entry, not a top-level error; the rest of the
+        // fan-out (if any) continues unaffected.
         let alice_url = "https://example.com/users/keyless";
         let mut actors = std::collections::HashMap::new();
         actors.insert(
@@ -516,14 +585,50 @@ mod tests {
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
         );
-        let err = outbox
+        let report = outbox
             .dispatch(
                 json!({ "id": "https://send.example/a/4", "type": "Create" }),
                 &[alice_url.parse().unwrap()],
             )
-            .await
-            .expect_err("actor without inbox must surface");
+            .await;
+        assert_eq!(report.enqueued, 0, "no inbox means nothing to enqueue");
+        assert_eq!(report.errors.len(), 1);
+        let (ref url, ref err) = report.errors[0];
+        assert_eq!(url.as_str(), alice_url);
         assert!(matches!(err, Error::ActorWithoutInbox(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_partially_succeeds_when_one_recipient_is_broken() {
+        // Two recipients: one resolves cleanly, one cannot be
+        // fetched. The good recipient still gets enqueued.
+        let alice_url = "https://example.com/users/alice";
+        let broken_url = "https://example.com/users/404";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            alice_url.into(),
+            actor_with_inbox(alice_url, "https://example.com/users/alice/inbox"),
+        );
+        // `broken_url` deliberately absent -> StaticFetcher 404.
+        let deliverer = Arc::new(RecordingDeliverer::new(0));
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::clone(&deliverer)),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+        );
+        let report = outbox
+            .dispatch(
+                json!({ "id": "https://send.example/a/5", "type": "Create" }),
+                &[alice_url.parse().unwrap(), broken_url.parse().unwrap()],
+            )
+            .await;
+
+        assert_eq!(
+            report.enqueued, 1,
+            "only the resolvable recipient is enqueued"
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].0.as_str(), broken_url);
     }
 
     /// Adapter so the `Outbox` (which owns its `Deliverer` by value)

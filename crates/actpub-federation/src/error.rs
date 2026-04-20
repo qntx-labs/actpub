@@ -90,6 +90,23 @@ pub enum Error {
     #[error("actor has no usable public key: {0}")]
     ActorWithoutKey(String),
 
+    /// The signing actor's identity does not match the key that
+    /// signed the request.
+    ///
+    /// Raised when one of the cross-checks that binds the HTTP
+    /// signature to a Fediverse identity fails:
+    ///
+    /// - the `keyId` host differs from the `actor.id` host returned
+    ///   by the fetcher (classic cross-domain impersonation attack),
+    /// - a legacy `publicKey.id` is present but does not equal the
+    ///   `keyId` actually used to sign the request.
+    ///
+    /// This variant is the security boundary between "verified the
+    /// signature" and "trusted the signer" -- treat it as a 401 / 403
+    /// at the HTTP layer.
+    #[error("signer identity does not match signing key: {0}")]
+    SignerKeyMismatch(String),
+
     /// The user-supplied [`ActivityHandler`](crate::ActivityHandler)
     /// returned an error.
     #[error("activity handler failed: {0}")]

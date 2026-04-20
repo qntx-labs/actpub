@@ -7,7 +7,13 @@
 //! which the router serialises with the RFC 7033 mandated
 //! `application/jrd+json` media type.
 //!
+//! Every response carries `Access-Control-Allow-Origin: *` per
+//! [RFC 7033 §8.4][cors] so that browser-based Fediverse clients
+//! can query the endpoint cross-origin without requiring a
+//! pre-flight (the `GET` request is a CORS "simple" request).
+//!
 //! [RFC 7033]: https://datatracker.ietf.org/doc/html/rfc7033
+//! [cors]: https://datatracker.ietf.org/doc/html/rfc7033#section-8.4
 
 use std::sync::Arc;
 
@@ -21,6 +27,9 @@ use serde::Deserialize;
 
 /// `Content-Type` mandated by RFC 7033 §10.2 for JRD responses.
 pub const JRD_CONTENT_TYPE: &str = "application/jrd+json";
+
+/// Wildcard CORS header value mandated by RFC 7033 §8.4.
+const CORS_ALLOW_ANY_ORIGIN: &str = "*";
 
 /// Asynchronous callback that resolves a `?resource=<uri>` query into
 /// a [`Jrd`] describing it.
@@ -68,23 +77,24 @@ async fn handle<R>(
 where
     R: WebFingerResolver,
 {
+    let cors = (header::ACCESS_CONTROL_ALLOW_ORIGIN, CORS_ALLOW_ANY_ORIGIN);
     match resolver.resolve(q.resource).await {
         Ok(Some(jrd)) => match serde_json::to_vec(&jrd) {
             Ok(body) => (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, JRD_CONTENT_TYPE)],
+                [(header::CONTENT_TYPE, JRD_CONTENT_TYPE), cors],
                 body,
             )
                 .into_response(),
             Err(err) => {
                 tracing::error!(target: "actpub::axum::webfinger", %err, "JRD serialise failed");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, [cors]).into_response()
             }
         },
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, [cors]).into_response(),
         Err(err) => {
             tracing::warn!(target: "actpub::axum::webfinger", reason = %err, "resolver failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, [cors]).into_response()
         }
     }
 }
@@ -165,5 +175,42 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // axum's Query extractor rejects with 400 on missing fields.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_emits_cors_header_on_success() {
+        // RFC 7033 §8.4 MUSTs `Access-Control-Allow-Origin: *` so
+        // browser-based Fediverse UIs can query the endpoint.
+        let app = webfinger_router(StaticResolver(Some(alice_jrd())));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/.well-known/webfinger?resource=acct:alice@example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+        );
+    }
+
+    #[tokio::test]
+    async fn router_emits_cors_header_on_404() {
+        let app = webfinger_router(StaticResolver(None));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/.well-known/webfinger?resource=acct:ghost@example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+        );
     }
 }

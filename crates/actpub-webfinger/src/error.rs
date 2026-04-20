@@ -43,6 +43,17 @@ pub enum Error {
     #[error("WebFinger server returned status {0}")]
     BadStatus(u16),
 
+    /// The server's response body exceeded the configured body cap
+    /// before it could be fully read.
+    ///
+    /// This is a `DoS` guard: a malicious or compromised `WebFinger`
+    /// responder could otherwise stream gigabytes of JSON into the
+    /// client and exhaust memory.
+    #[cfg(feature = "client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+    #[error("WebFinger response exceeded {0} bytes")]
+    ResponseTooLarge(u64),
+
     /// The response body could not be parsed as JSON.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

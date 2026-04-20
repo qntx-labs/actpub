@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 
-use actpub_httpsig::{CavageSigner, sha256_digest_header};
+use actpub_httpsig::CavageSigner;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::Method;
@@ -63,6 +63,13 @@ pub const AP_CONTENT_TYPE: &str = "application/activity+json";
 /// JSON-LD media type prefix used by Lemmy, Mitra and others for
 /// the same documents.
 pub const LD_CONTENT_TYPE_PREFIX: &str = "application/ld+json";
+
+/// Header set used when signing authenticated GET fetches.
+///
+/// Per Mastodon's authorized-fetch contract: `(request-target)`,
+/// `host`, `date` — `digest` is intentionally excluded because GET
+/// requests carry no body to digest.
+const SIGNED_FETCH_HEADER_SET: &[&str] = &["(request-target)", "host", "date"];
 
 /// Asynchronous accessor that turns an `ActivityPub` URL into a JSON
 /// document.
@@ -231,15 +238,10 @@ impl Fetcher for ReqwestFetcher {
     }
 }
 
-/// Signs an outbound `reqwest` GET builder with the configured
-/// Cavage HTTP-Signature key. Used by the fetcher when
-/// [`FederationConfig::signed_fetch`] is enabled.
-fn sign_get_request(
-    mut req: reqwest::RequestBuilder,
-    url: &Url,
-    config: &FederationConfig,
-) -> Result<reqwest::RequestBuilder, Error> {
-    let mut http_req = http::Request::builder()
+/// Builds an `http::Request` with the headers a signed GET fetch must
+/// carry: `host` and `date`. The signer then adds `Signature:`.
+fn build_signed_get_skeleton(url: &Url) -> Result<http::Request<Vec<u8>>, Error> {
+    http::Request::builder()
         .method(Method::GET)
         .uri(url.as_str())
         .header("host", url.host_str().unwrap_or(""))
@@ -251,8 +253,21 @@ fn sign_get_request(
         .map_err(|e| Error::PolicyViolation {
             url: url.clone(),
             reason: format!("could not build signed GET request: {e}"),
-        })?;
-    CavageSigner::new(&config.signing_key, config.key_id.as_str()).sign(&mut http_req)?;
+        })
+}
+
+/// Signs an outbound `reqwest` GET builder with the configured
+/// Cavage HTTP-Signature key. Used by the fetcher when
+/// [`FederationConfig::signed_fetch`] is enabled.
+fn sign_get_request(
+    mut req: reqwest::RequestBuilder,
+    url: &Url,
+    config: &FederationConfig,
+) -> Result<reqwest::RequestBuilder, Error> {
+    let mut http_req = build_signed_get_skeleton(url)?;
+    CavageSigner::new(&config.signing_key, config.key_id.as_str())
+        .with_headers(SIGNED_FETCH_HEADER_SET.iter().copied())
+        .sign(&mut http_req)?;
     for (name, value) in http_req.headers() {
         let Ok(v) = value.to_str() else { continue };
         req = req.header(name.as_str(), v);
@@ -265,7 +280,10 @@ fn sign_get_request(
 /// [`FederationConfig::signed_fetch`] is enabled.
 ///
 /// Useful in tests and tooling that need to inspect or replay the
-/// wire-format signature without performing a real fetch.
+/// wire-format signature without performing a real fetch. The header
+/// set signed is the same as the one used by [`sign_get_request`]:
+/// `(request-target)`, `host`, `date` (no `digest`, since GETs have
+/// no body).
 ///
 /// # Errors
 ///
@@ -276,22 +294,10 @@ pub fn signed_fetch_signature_header(
     config: &FederationConfig,
     url: &Url,
 ) -> Result<String, Error> {
-    let body: Vec<u8> = Vec::new();
-    let mut req = http::Request::builder()
-        .method(Method::GET)
-        .uri(url.as_str())
-        .header("host", url.host_str().unwrap_or(""))
-        .header(
-            "date",
-            httpdate::fmt_http_date(std::time::SystemTime::now()),
-        )
-        .header("digest", sha256_digest_header(&body))
-        .body(body)
-        .map_err(|e| Error::PolicyViolation {
-            url: url.clone(),
-            reason: format!("could not build signed GET request: {e}"),
-        })?;
-    CavageSigner::new(&config.signing_key, config.key_id.as_str()).sign(&mut req)?;
+    let mut req = build_signed_get_skeleton(url)?;
+    CavageSigner::new(&config.signing_key, config.key_id.as_str())
+        .with_headers(SIGNED_FETCH_HEADER_SET.iter().copied())
+        .sign(&mut req)?;
     Ok(req
         .headers()
         .get("signature")
@@ -300,6 +306,16 @@ pub fn signed_fetch_signature_header(
         .to_owned())
 }
 
+/// Whether `content_type` names one of the media types the
+/// `ActivityPub` specification permits for actor / activity
+/// documents: [`AP_CONTENT_TYPE`] or anything beginning with
+/// [`LD_CONTENT_TYPE_PREFIX`].
+///
+/// Bare `application/json` is intentionally rejected: `ActivityPub`
+/// §3.2 is explicit about the two acceptable media types, and
+/// accepting plain JSON invites content-type confusion where a
+/// non-AP endpoint (OAuth error, RSS feed, etc.) is misread as an
+/// actor document.
 fn is_activitypub_media_type(content_type: &str) -> bool {
     let primary = content_type
         .split(';')
@@ -307,9 +323,7 @@ fn is_activitypub_media_type(content_type: &str) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    primary == AP_CONTENT_TYPE
-        || primary == "application/json"
-        || primary.starts_with(LD_CONTENT_TYPE_PREFIX)
+    primary == AP_CONTENT_TYPE || primary.starts_with(LD_CONTENT_TYPE_PREFIX)
 }
 
 #[cfg(test)]
@@ -345,7 +359,9 @@ mod tests {
         assert!(is_activitypub_media_type(
             "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
         ));
-        assert!(is_activitypub_media_type("application/json"));
+        // `application/json` is NOT a valid ActivityPub media type
+        // per §3.2 — accepting it would allow content-type confusion.
+        assert!(!is_activitypub_media_type("application/json"));
         assert!(!is_activitypub_media_type("text/html"));
         assert!(!is_activitypub_media_type(""));
     }
@@ -357,13 +373,15 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/users/alice"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", AP_CONTENT_TYPE)
-                    .set_body_json(json!({
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::to_vec(&json!({
                         "id": url,
                         "type": "Person",
                         "preferredUsername": "alice"
-                    })),
+                    }))
+                    .unwrap(),
+                    AP_CONTENT_TYPE,
+                ),
             )
             .expect(1)
             .mount(&server)
@@ -380,11 +398,10 @@ mod tests {
         let url = format!("{}/users/bob", server.uri());
         Mock::given(method("GET"))
             .and(path("/users/bob"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", AP_CONTENT_TYPE)
-                    .set_body_json(json!({ "id": url, "type": "Person" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&json!({ "id": url, "type": "Person" })).unwrap(),
+                AP_CONTENT_TYPE,
+            ))
             // Second call MUST be served from the cache, not the server.
             .expect(1)
             .mount(&server)
@@ -401,11 +418,10 @@ mod tests {
         let url = format!("{}/users/carol", server.uri());
         Mock::given(method("GET"))
             .and(path("/users/carol"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", AP_CONTENT_TYPE)
-                    .set_body_json(json!({ "id": url, "type": "Person" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&json!({ "id": url, "type": "Person" })).unwrap(),
+                AP_CONTENT_TYPE,
+            ))
             // Both calls MUST hit the server.
             .expect(2)
             .mount(&server)
@@ -514,13 +530,15 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/u/dave"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", AP_CONTENT_TYPE)
-                    .set_body_json(json!({
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::to_vec(&json!({
                         "id": url,
                         "type": "Person",
                         "preferredUsername": "dave"
-                    })),
+                    }))
+                    .unwrap(),
+                    AP_CONTENT_TYPE,
+                ),
             )
             .mount(&server)
             .await;

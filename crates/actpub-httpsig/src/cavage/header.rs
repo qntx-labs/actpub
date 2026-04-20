@@ -53,7 +53,7 @@ impl CavageHeaderParams {
             let (name, value) = split_once_trim(pair, '=').ok_or_else(|| {
                 Error::MalformedSignatureHeader(format!("missing `=` in `{pair}`"))
             })?;
-            let value = unquote(value);
+            let value = unquote(value)?;
             match name {
                 "keyId" | "keyid" => key_id = Some(value.into_owned()),
                 "algorithm" => algorithm = Some(value.into_owned()),
@@ -70,12 +70,21 @@ impl CavageHeaderParams {
         let key_id = key_id.ok_or(Error::MissingSignatureParameter("keyId"))?;
         let signature = signature.ok_or(Error::MissingSignatureParameter("signature"))?;
 
-        // Per §2.1.3 default `headers` is `(created)`; if `created` is
-        // absent the spec says implementations SHOULD send `date` instead.
-        // Fediverse actors always set `headers` explicitly, so defaulting
-        // is a pure fallback.
+        // Per draft §2.1.3: "If not specified, [headers] defaults to
+        // the single value `(created)`. If the `created` signature
+        // parameter is not provided, this parameter defaults to
+        // the single value `date`."
+        //
+        // Fediverse actors always set `headers` explicitly, so the
+        // defaulting branch is a pure fallback for spec-correctness.
         let headers = headers_field.map_or_else(
-            || CavageHeaderSet::new(["(created)"]),
+            || {
+                if created.is_some() {
+                    CavageHeaderSet::new(["(created)"])
+                } else {
+                    CavageHeaderSet::new(["date"])
+                }
+            },
             |v| CavageHeaderSet::new(v.split_ascii_whitespace().map(str::to_owned)),
         );
 
@@ -145,30 +154,38 @@ fn parse_i64_param(name: &'static str, value: &str) -> Result<i64, Error> {
     })
 }
 
-fn unquote(raw: &str) -> std::borrow::Cow<'_, str> {
+fn unquote(raw: &str) -> Result<std::borrow::Cow<'_, str>, Error> {
     if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
-        return std::borrow::Cow::Borrowed(raw);
+        return Ok(std::borrow::Cow::Borrowed(raw));
     }
     let inner = &raw[1..raw.len() - 1];
     if !inner.contains('\\') {
-        return std::borrow::Cow::Borrowed(inner);
+        return Ok(std::borrow::Cow::Borrowed(inner));
     }
-    std::borrow::Cow::Owned(unescape(inner))
+    Ok(std::borrow::Cow::Owned(unescape(inner)?))
 }
 
-fn unescape(inner: &str) -> String {
+/// Unescapes a quoted-string body: `\<X>` becomes `<X>` for any
+/// `<X>`. A trailing lone backslash is an encoding error and is
+/// signalled by [`Error::MalformedSignatureHeader`] via the caller
+/// re-wrapping; `unquote` upgrades the result to `Cow::Owned` only
+/// after confirming the escape sequence is well-formed.
+fn unescape(inner: &str) -> Result<String, Error> {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
-            }
+            let next = chars.next().ok_or_else(|| {
+                Error::MalformedSignatureHeader(
+                    "quoted-string ends with a lone backslash".to_owned(),
+                )
+            })?;
+            out.push(next);
         } else {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -239,5 +256,34 @@ mod tests {
         let params = CavageHeaderParams::parse(raw).expect("parse");
         assert_eq!(params.key_id, "has,comma");
         assert_eq!(params.signature, "ZmF,vo");
+    }
+
+    #[test]
+    fn missing_headers_parameter_with_created_defaults_to_created_pseudo() {
+        // Per §2.1.3 the default `headers` value is `(created)` when
+        // the `created` parameter is present.
+        let raw = r#"keyId="k",created=1700000000,signature="Zm9v""#;
+        let params = CavageHeaderParams::parse(raw).expect("parse");
+        assert_eq!(params.headers.len(), 1);
+        assert!(params.headers.iter().any(|h| h == "(created)"));
+    }
+
+    #[test]
+    fn missing_headers_parameter_without_created_defaults_to_date() {
+        // §2.1.3 falls back to `date` when both `headers` and
+        // `created` are absent -- the Mastodon-compatible corner case.
+        let raw = r#"keyId="k",signature="Zm9v""#;
+        let params = CavageHeaderParams::parse(raw).expect("parse");
+        assert_eq!(params.headers.len(), 1);
+        assert!(params.headers.iter().any(|h| h == "date"));
+    }
+
+    #[test]
+    fn quoted_string_with_trailing_backslash_is_rejected() {
+        // A lone trailing backslash inside a quoted string is an
+        // encoding error; previously this was silently dropped.
+        let raw = r#"keyId="k\",headers="host",signature="Zm9v""#;
+        let err = CavageHeaderParams::parse(raw).expect_err("malformed escape must fail");
+        assert!(matches!(err, Error::MalformedSignatureHeader(_)));
     }
 }

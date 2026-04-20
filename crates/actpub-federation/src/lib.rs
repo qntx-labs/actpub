@@ -70,7 +70,7 @@ pub use self::fetcher::{
     signed_fetch_signature_header,
 };
 pub use self::inbox::{ActivityHandler, InboxOutcome, InboxPipeline};
-pub use self::outbox::Outbox;
+pub use self::outbox::{DispatchReport, InboxResolution, Outbox};
 pub use self::policy::UrlPolicy;
 pub use self::retry::RetryPolicy;
 

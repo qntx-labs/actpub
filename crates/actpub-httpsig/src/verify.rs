@@ -114,6 +114,7 @@ mod tests {
             .header("host", "example.com")
             .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
             .header("digest", sha256_digest_header(body))
+            .header("content-type", "application/activity+json")
             .body(body.to_vec())
             .expect("valid")
     }

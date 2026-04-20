@@ -67,7 +67,9 @@ pub mod rels;
 pub use self::account::Account;
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
-pub use self::client::{fetch_at, resolve};
+pub use self::client::{
+    DEFAULT_MAX_BODY_BYTES, fetch_at, fetch_at_with_limit, recommended_client, resolve,
+};
 pub use self::error::Error;
 pub use self::jrd::{Jrd, JrdBuilder, JrdLink, JrdLinkBuilder};
 

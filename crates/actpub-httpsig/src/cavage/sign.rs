@@ -9,12 +9,24 @@ use crate::cavage::header::{CavageHeaderParams, SIGNATURE_HEADER};
 use crate::error::Error;
 use crate::key::{Algorithm, SigningKey};
 
-/// The default header set used by Mastodon and Lemmy for outbound
-/// requests: `(request-target)`, `host`, `date`, `digest`.
+/// The default header set signed on outbound POST requests.
 ///
-/// Callers typically construct a [`CavageSigner`] without specifying the
-/// header set, in which case this default applies.
-pub const DEFAULT_HEADER_SET: &[&str] = &["(request-target)", "host", "date", "digest"];
+/// Contains the five headers every mainstream Fediverse
+/// implementation (Mastodon, Pleroma, Lemmy, Mitra, Misskey)
+/// expects to see participate in the signature base:
+///
+/// - `(request-target)` -- method + path + query pseudo-header
+/// - `host` -- domain the request is being sent to
+/// - `date` -- HTTP-date used for replay-window enforcement
+/// - `digest` -- legacy body digest (RFC 3230 / 5843)
+/// - `content-type` -- defence against content-type confusion
+///   attacks; Mitra and strict Lemmy versions require it and
+///   Mastodon simply ignores additional signed headers
+///
+/// Callers typically construct a [`CavageSigner`] without
+/// specifying the header set, in which case this default applies.
+pub const DEFAULT_HEADER_SET: &[&str] =
+    &["(request-target)", "host", "date", "digest", "content-type"];
 
 /// A request signer that attaches a Cavage `Signature:` header to an
 /// `http::Request`.
@@ -154,6 +166,7 @@ mod tests {
             .header("host", "example.com")
             .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
             .header("digest", sha256_digest_header(body))
+            .header("content-type", "application/activity+json")
             .body(body.to_vec())
             .expect("valid request")
     }

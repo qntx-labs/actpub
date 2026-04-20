@@ -13,8 +13,8 @@
 //! | `@authority`      | `Host` header / authority, lowercase     |
 //! | `@scheme`         | scheme, lowercase (`http` / `https`)     |
 //! | `@path`           | URI path                                 |
-//! | `@query`          | URI query string including the `?`       |
-//! | `@request-target` | `<lower-method>` `<path-and-query>`      |
+//! | `@query`          | URI query string including the `?`, `?` when absent |
+//! | `@request-target` | `<path-and-query>` (method excluded per §2.2.5)      |
 //! | `<header-name>`   | comma-joined values, OWS-trimmed         |
 //!
 //! `@query-param`, `@status` and the `;req`, `;bs`, `;sf`, `;tr`, `;name`
@@ -44,11 +44,20 @@ pub enum Component {
     Scheme,
     /// URI path component.
     Path,
-    /// URI query component including leading `?`.
+    /// URI query component including the leading `?`. When the
+    /// request URI has no query, the canonical value is the
+    /// single character `?` per [RFC 9421 §2.2.7][q].
+    ///
+    /// [q]: https://www.rfc-editor.org/rfc/rfc9421.html#section-2.2.7
     Query,
-    /// Legacy `(request-target)` pseudo-header, kept here for
-    /// interoperability with signers that still emit it inside RFC 9421
-    /// signature bases. Cavage verifiers do not use this variant.
+    /// `@request-target` derived component: path and query of the
+    /// request target, **without the method**, per
+    /// [RFC 9421 §2.2.5][rt]. This is semantically distinct from
+    /// Cavage's `(request-target)` pseudo-header which does include
+    /// the method; the Cavage signer / verifier handles that shape
+    /// in [`crate::cavage`] independently.
+    ///
+    /// [rt]: https://www.rfc-editor.org/rfc/rfc9421.html#section-2.2.5
     RequestTarget,
     /// An ordinary lower-cased HTTP header name.
     Header(String),
@@ -156,16 +165,19 @@ fn scheme<B>(req: &Request<B>) -> String {
 }
 
 fn query_with_leading_q<B>(req: &Request<B>) -> String {
-    req.uri().query().map_or(String::new(), |q| format!("?{q}"))
+    // RFC 9421 §2.2.7: "If the query string is absent from the request
+    // URI, the value is the leading `?` character alone."
+    req.uri()
+        .query()
+        .map_or_else(|| "?".to_owned(), |q| format!("?{q}"))
 }
 
 fn request_target<B>(req: &Request<B>) -> String {
-    let method = req.method().as_str().to_ascii_lowercase();
-    let pq = req
-        .uri()
+    // RFC 9421 §2.2.5: "The request method is not included in the
+    // request target." The canonical value is just the path-and-query.
+    req.uri()
         .path_and_query()
-        .map_or_else(|| req.uri().path().to_owned(), ToString::to_string);
-    format!("{method} {pq}")
+        .map_or_else(|| req.uri().path().to_owned(), ToString::to_string)
 }
 
 fn header_value<B>(req: &Request<B>, lower_name: &str) -> Result<String, Error> {
@@ -253,6 +265,41 @@ mod tests {
         let req = sample();
         assert_eq!(canonical_value(&Component::Path, &req).unwrap(), "/inbox");
         assert_eq!(canonical_value(&Component::Query, &req).unwrap(), "?a=1");
+    }
+
+    #[test]
+    fn empty_query_canonicalises_to_single_question_mark() {
+        // RFC 9421 §2.2.7 explicitly specifies this edge case.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/inbox")
+            .body(Vec::<u8>::new())
+            .expect("valid");
+        assert_eq!(canonical_value(&Component::Query, &req).unwrap(), "?");
+    }
+
+    #[test]
+    fn request_target_excludes_method_per_rfc9421() {
+        // Cavage's `(request-target)` includes the method, but RFC 9421's
+        // `@request-target` MUST NOT (§2.2.5).
+        let req = sample();
+        assert_eq!(
+            canonical_value(&Component::RequestTarget, &req).unwrap(),
+            "/inbox?a=1",
+        );
+    }
+
+    #[test]
+    fn request_target_is_just_path_when_query_absent() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/inbox")
+            .body(Vec::<u8>::new())
+            .expect("valid");
+        assert_eq!(
+            canonical_value(&Component::RequestTarget, &req).unwrap(),
+            "/inbox",
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! [RFC 9530]: https://www.rfc-editor.org/rfc/rfc9530.html
 
 use aws_lc_rs::digest::{self, SHA256, SHA512};
-use sfv::{BareItem, Dictionary, Item, ListEntry, Parser, SerializeValue};
+use sfv::{BareItem, Dictionary, FieldType, Item, Key, ListEntry, Parser};
 
 use crate::error::Error;
 
@@ -100,23 +100,25 @@ pub fn content_digest_header(body: &[u8]) -> String {
 ///
 /// # Panics
 ///
-/// Panics only if `sfv` fails to serialise a `ByteSeq`-only dictionary;
-/// this is unreachable for any well-formed input.
+/// Panics only if `sfv` fails to serialise a byte-sequence-only
+/// dictionary; this is unreachable for any well-formed input, since the
+/// algorithm tokens are hard-coded to valid sf-keys.
 #[must_use]
+#[allow(
+    clippy::expect_used,
+    reason = "algorithm tokens are hard-coded valid sf-keys and byte-sequence dictionaries always serialise"
+)]
 pub fn content_digest_header_with(body: &[u8], algorithms: &[DigestAlgorithm]) -> String {
     let mut dict = Dictionary::new();
     for algo in algorithms {
+        let key = Key::try_from(algo.token().to_owned())
+            .expect("algorithm token is always a valid sf-key");
         dict.insert(
-            algo.token().into(),
-            ListEntry::Item(Item::new(BareItem::ByteSeq(algo.hash(body)))),
+            key,
+            ListEntry::Item(Item::new(BareItem::ByteSequence(algo.hash(body)))),
         );
     }
-    #[allow(
-        clippy::expect_used,
-        reason = "serialising a ByteSeq-only dictionary cannot fail"
-    )]
-    dict.serialize_value()
-        .expect("ByteSeq dictionary is always serialisable")
+    FieldType::serialize(&dict).expect("byte-sequence dictionary is always serialisable")
 }
 
 /// Verifies that the `Content-Digest:` header carries a `sha-256`
@@ -211,10 +213,12 @@ fn verify_specific_digest(header: &str, body: &[u8], algo: DigestAlgorithm) -> R
 }
 
 fn parse_content_digest_dict(header: &str) -> Result<Dictionary, Error> {
-    Parser::parse_dictionary(header.as_bytes()).map_err(|e| Error::InvalidHeader {
-        name: "content-digest",
-        reason: e.to_owned(),
-    })
+    Parser::new(header)
+        .parse::<Dictionary>()
+        .map_err(|e| Error::InvalidHeader {
+            name: "content-digest",
+            reason: e.to_string(),
+        })
 }
 
 fn extract_byte_seq<'a>(entry: &'a ListEntry, algo_token: &str) -> Result<&'a [u8], Error> {
@@ -227,7 +231,7 @@ fn extract_byte_seq<'a>(entry: &'a ListEntry, algo_token: &str) -> Result<&'a [u
             });
         }
     };
-    let BareItem::ByteSeq(bytes) = &item.bare_item else {
+    let BareItem::ByteSequence(bytes) = &item.bare_item else {
         return Err(Error::InvalidHeader {
             name: "content-digest",
             reason: format!("{algo_token} value must be a byte sequence"),

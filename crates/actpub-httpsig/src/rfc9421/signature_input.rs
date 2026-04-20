@@ -11,7 +11,7 @@
 //! convention); a single request may carry multiple labels so that
 //! middle boxes can attach their own signatures.
 
-use sfv::{BareItem, ListEntry, Parser};
+use sfv::{BareItem, Dictionary, ListEntry, Parser};
 
 use crate::error::Error;
 use crate::rfc9421::components::Component;
@@ -171,10 +171,13 @@ impl SignatureInput {
 /// and [`Error::MalformedSignatureHeader`] if any entry's components or
 /// parameters are malformed.
 pub fn parse_signature_input_dict(raw: &str) -> Result<Vec<(String, SignatureInput)>, Error> {
-    let dict = Parser::parse_dictionary(raw.as_bytes()).map_err(|e| Error::InvalidHeader {
-        name: SIGNATURE_INPUT_HEADER,
-        reason: e.to_owned(),
-    })?;
+    let dict: Dictionary =
+        Parser::new(raw)
+            .parse()
+            .map_err(|e: sfv::Error| Error::InvalidHeader {
+                name: SIGNATURE_INPUT_HEADER,
+                reason: e.to_string(),
+            })?;
 
     let mut out = Vec::with_capacity(dict.len());
     for (label, entry) in dict {
@@ -196,10 +199,11 @@ pub fn parse_signature_input_dict(raw: &str) -> Result<Vec<(String, SignatureInp
                         "entry `{label}` contains a non-string component"
                     )));
                 };
-                Component::parse(s)
+                Component::parse(s.as_str())
             })
             .collect::<Result<_, _>>()?;
 
+        let label_str = label.as_str();
         let mut input = SignatureInput {
             components,
             keyid: None,
@@ -212,19 +216,23 @@ pub fn parse_signature_input_dict(raw: &str) -> Result<Vec<(String, SignatureInp
 
         for (pname, pvalue) in &inner_list.params {
             match pname.as_str() {
-                param::KEYID => input.keyid = string_param(pvalue, &label, param::KEYID)?,
-                param::ALG => input.algorithm = string_param(pvalue, &label, param::ALG)?,
-                param::CREATED => input.created = integer_param(pvalue, &label, param::CREATED)?,
-                param::EXPIRES => input.expires = integer_param(pvalue, &label, param::EXPIRES)?,
-                param::NONCE => input.nonce = string_param(pvalue, &label, param::NONCE)?,
-                param::TAG => input.tag = string_param(pvalue, &label, param::TAG)?,
+                param::KEYID => input.keyid = string_param(pvalue, label_str, param::KEYID)?,
+                param::ALG => input.algorithm = string_param(pvalue, label_str, param::ALG)?,
+                param::CREATED => {
+                    input.created = integer_param(pvalue, label_str, param::CREATED)?;
+                }
+                param::EXPIRES => {
+                    input.expires = integer_param(pvalue, label_str, param::EXPIRES)?;
+                }
+                param::NONCE => input.nonce = string_param(pvalue, label_str, param::NONCE)?,
+                param::TAG => input.tag = string_param(pvalue, label_str, param::TAG)?,
                 _ => {
                     // Unknown parameters are tolerated per §2.3.
                 }
             }
         }
 
-        out.push((label, input));
+        out.push((label.into(), input));
     }
 
     Ok(out)
@@ -232,7 +240,7 @@ pub fn parse_signature_input_dict(raw: &str) -> Result<Vec<(String, SignatureInp
 
 fn string_param(value: &BareItem, label: &str, param: &str) -> Result<Option<String>, Error> {
     match value {
-        BareItem::String(s) => Ok(Some(s.clone())),
+        BareItem::String(s) => Ok(Some(s.as_str().to_owned())),
         _ => Err(Error::MalformedSignatureHeader(format!(
             "entry `{label}` has non-string `{param}` parameter"
         ))),
@@ -241,7 +249,7 @@ fn string_param(value: &BareItem, label: &str, param: &str) -> Result<Option<Str
 
 fn integer_param(value: &BareItem, label: &str, param: &str) -> Result<Option<i64>, Error> {
     match value {
-        BareItem::Integer(n) => Ok(Some(*n)),
+        BareItem::Integer(n) => Ok(Some(i64::from(*n))),
         _ => Err(Error::MalformedSignatureHeader(format!(
             "entry `{label}` has non-integer `{param}` parameter"
         ))),

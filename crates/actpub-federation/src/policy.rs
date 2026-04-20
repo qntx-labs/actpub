@@ -72,9 +72,17 @@ impl Default for UrlPolicy {
 
 impl UrlPolicy {
     /// Returns a permissive policy suitable for in-process tests:
-    /// allows `http`, IP literals and loopback hosts. Production code
-    /// MUST NOT use this profile.
+    /// allows `http`, IP literals and loopback hosts. Production
+    /// code MUST NOT use this profile.
+    ///
+    /// Gated behind the `test-util` Cargo feature (and unconditionally
+    /// available inside `cfg(test)`) so that downstream crates cannot
+    /// accidentally call it from production code paths. Integration
+    /// tests that need a permissive profile should depend on this
+    /// crate with `features = ["test-util"]`.
     #[must_use]
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
     pub const fn permissive_for_tests() -> Self {
         Self {
             require_https: false,

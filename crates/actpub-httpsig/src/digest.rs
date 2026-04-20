@@ -54,12 +54,14 @@ pub fn verify_digest_header(header: &str, body: &[u8]) -> Result<(), Error> {
 
     let expected = digest::digest(&SHA256, body);
 
-    let mut buf = [0u8; 32];
-    let actual = Base64::decode(encoded, &mut buf)?;
-    if actual.len() != 32 {
-        return Err(Error::DigestMismatch);
-    }
-    if !constant_time_eq(actual, expected.as_ref()) {
+    // Decode into a heap buffer sized from the payload: if the
+    // sender declared `SHA-256=` but attached a 64-byte digest
+    // (e.g. SHA-512 bytes), we still want to surface the result
+    // as `DigestMismatch` rather than `InvalidBase64`, so the
+    // calling code has one consistent failure mode for every
+    // "body and digest disagree" shape.
+    let decoded = Base64::decode_vec(encoded).map_err(|_| Error::DigestMismatch)?;
+    if !constant_time_eq(&decoded, expected.as_ref()) {
         return Err(Error::DigestMismatch);
     }
     Ok(())
