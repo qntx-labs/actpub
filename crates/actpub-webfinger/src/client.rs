@@ -22,6 +22,8 @@
 //!   resource; a misconfigured or malicious responder cannot swap
 //!   identities under the caller's feet.
 
+use std::time::Duration;
+
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, header};
 use tracing::debug;
@@ -37,15 +39,40 @@ use crate::{Account, Error, Jrd};
 /// against a hostile responder.
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024;
 
+/// Default end-to-end request timeout used by [`recommended_client`].
+///
+/// Covers DNS, TCP, TLS, and the whole request / response exchange.
+/// Bounds the damage a *slow-loris*-style responder can do: without
+/// this cap, a remote host that accepts the connection and then
+/// dribbles one byte every few seconds would hold a file descriptor
+/// and a tokio task open indefinitely.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default TCP-connect timeout used by [`recommended_client`].
+///
+/// Shorter than [`DEFAULT_REQUEST_TIMEOUT`] because a server that
+/// cannot even complete the handshake in a few seconds is almost
+/// certainly unreachable; failing fast here frees the task to move
+/// on to the next recipient in a fan-out.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Builds a [`reqwest::Client`] pre-configured for safe `WebFinger`
 /// resolution.
 ///
-/// The returned client uses a strict redirect policy — at most two
-/// redirects, all to the same origin — which matches Mastodon's
-/// defaults and neutralises cross-origin redirect attacks on the
-/// endpoint. Callers that need custom behaviour (e.g. a shared
-/// connection pool) can reuse the returned client or construct
-/// their own and pass it to [`resolve`] / [`fetch_at`] directly.
+/// The returned client uses:
+///
+/// - a strict redirect policy — at most two redirects, all to the
+///   same origin — which matches Mastodon's defaults and
+///   neutralises cross-origin redirect attacks on the endpoint;
+/// - a 10 s end-to-end request timeout
+///   ([`DEFAULT_REQUEST_TIMEOUT`]) and a 5 s TCP connect timeout
+///   ([`DEFAULT_CONNECT_TIMEOUT`]), defending against
+///   slow-loris responders that would otherwise pin the caller's
+///   tokio task and connection pool indefinitely.
+///
+/// Callers that need custom behaviour (e.g. a shared connection
+/// pool or a looser timeout for a trusted back-end) can build their
+/// own client and pass it to [`resolve`] / [`fetch_at`] directly.
 ///
 /// # Errors
 ///
@@ -53,6 +80,8 @@ pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024;
 /// initialised.
 pub fn recommended_client() -> Result<Client, Error> {
     Ok(ClientBuilder::new()
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .redirect(Policy::custom(|attempt| {
             const MAX_REDIRECTS: usize = 2;
             if attempt.previous().len() >= MAX_REDIRECTS {
@@ -455,5 +484,45 @@ mod tests {
     #[test]
     fn recommended_client_builds_without_panicking() {
         let _ = recommended_client().expect("TLS stack must initialise");
+    }
+
+    #[tokio::test]
+    async fn recommended_client_times_out_on_slow_responder() {
+        // P1-N18 regression: the recommended client must enforce a
+        // total-request timeout. Without it, a slow-loris responder
+        // (here simulated by `ResponseTemplate::delay`) would pin
+        // the caller's tokio task and file descriptor for the full
+        // delay, multiplying into a DoS when fanning out to 1 000s
+        // of recipients.
+        //
+        // We use `DEFAULT_REQUEST_TIMEOUT` (10 s) by construction
+        // and set the server's delay to 30 s: the request MUST
+        // error out within ~10 s rather than wait 30 s.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/webfinger"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "subject": "acct:a@b.example" }))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = recommended_client().expect("recommended client must build");
+        let started = std::time::Instant::now();
+        let result = fetch_at(&mock_url(&server, "acct:a@b.example"), None, &client).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "slow responder must surface as an error, not a delayed Ok",
+        );
+        // Budget = configured 10 s request timeout + a wide 5 s
+        // runtime slack so a slow CI host doesn't flake this.
+        assert!(
+            elapsed < DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(5),
+            "fetch_at took {elapsed:?}, expected timeout near {DEFAULT_REQUEST_TIMEOUT:?}",
+        );
     }
 }

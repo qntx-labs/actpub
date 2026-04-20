@@ -59,8 +59,8 @@ use std::sync::Arc;
 
 use actpub_httpsig::{
     CavageHeaderParams, Multikey as HsMultikey, SIGNATURE_HEADER, VerifyingKey,
-    parse_signature_input_dict, verify_any_content_digest_header, verify_digest_header,
-    verify_with_policy,
+    parse_signature_input_dict, sha256_digest_header, verify_any_content_digest_header,
+    verify_digest_header, verify_with_policy,
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -250,17 +250,33 @@ where
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Dedup key is normalised so that `https://Example.COM/a/1`
-        // and `https://example.com/a/1/` are recognised as the same
-        // activity; otherwise the cheapest replay attack is a
-        // capitalisation flip.
-        let dedup_key = activity_id.as_deref().map(normalise_activity_id);
+        // Dedup key selection:
+        //
+        // - When the activity carries an `id`, we canonicalise it
+        //   (`https://Example.COM/a/1` and `https://example.com/a/1/`
+        //   collapse to the same key) so the cheapest replay attack
+        //   is not a capitalisation flip.
+        // - When no `id` is present — legitimate in some Misskey
+        //   custom activity shapes and also the degenerate shape a
+        //   buggy peer might burst-resend — we fall back to the
+        //   SHA-256 of the request body. The `SHA-256=` prefix
+        //   emitted by `sha256_digest_header` is URL-invalid, so a
+        //   body-hash key can never collide with a URL-derived
+        //   one's namespace even if a future peer happens to use a
+        //   literal `SHA-256=...` string as its activity id.
+        //
+        // Signature freshness has already gated a cross-capture
+        // replay; this dedup layer is the last line of defence
+        // against the *same* peer dispatching an activity twice in
+        // a burst (network retry, crash recovery, etc.) and having
+        // the handler fire twice.
+        let dedup_key: String = activity_id
+            .as_deref()
+            .map_or_else(|| sha256_digest_header(&body), normalise_activity_id);
 
-        if let Some(key) = &dedup_key
-            && self.inner.seen.contains_key(key)
-        {
+        if self.inner.seen.contains_key(&dedup_key) {
             return Ok(InboxOutcome::Duplicate {
-                activity_id: activity_id.clone().unwrap_or_else(|| key.clone()),
+                activity_id: activity_id.clone().unwrap_or_else(|| dedup_key.clone()),
             });
         }
 
@@ -270,9 +286,7 @@ where
             .await
             .map_err(|e| Error::HandlerFailed(e.to_string()))?;
 
-        if let Some(key) = dedup_key {
-            self.inner.seen.insert(key, ()).await;
-        }
+        self.inner.seen.insert(dedup_key, ()).await;
         Ok(InboxOutcome::Accepted { activity_id })
     }
 }
@@ -700,6 +714,43 @@ mod tests {
         assert!(matches!(first, InboxOutcome::Accepted { .. }));
         let second = pipeline.process(&parts, body).await.unwrap();
         assert!(matches!(second, InboxOutcome::Duplicate { .. }));
+    }
+
+    #[tokio::test]
+    async fn process_dedups_activity_without_id_via_body_sha256() {
+        // P2-N20 regression: an activity missing the `id` field used
+        // to bypass the dedup cache entirely, so a buggy / bursty
+        // peer re-sending the same payload would invoke the handler
+        // twice. We now fall back to `sha256(body)` as the dedup
+        // key, so the second identical POST reports `Duplicate`
+        // just like an id-bearing activity would.
+        let activity = json!({
+            // no "id" — legitimate for some Misskey custom shapes.
+            "type": "Create",
+            "actor": "https://send.example.com/users/alice",
+        });
+        let (parts, body, public) = signed_inbox_request(&activity);
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+
+        let first = pipeline.process(&parts, body.clone()).await.unwrap();
+        assert!(
+            matches!(first, InboxOutcome::Accepted { .. }),
+            "first delivery of an id-less activity must still be accepted",
+        );
+        let second = pipeline.process(&parts, body).await.unwrap();
+        assert!(
+            matches!(second, InboxOutcome::Duplicate { .. }),
+            "second delivery of the SAME id-less body must be deduped \
+             (the bug this regression test guards against silently \
+              invoked the handler twice)",
+        );
     }
 
     #[tokio::test]

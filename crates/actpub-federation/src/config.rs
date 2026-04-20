@@ -96,6 +96,18 @@ pub const DEFAULT_DELIVERY_CONCURRENCY: usize = 100;
 /// every moderately-funded deployment can accept.
 pub const DEFAULT_DELIVERY_QUEUE_CAPACITY: usize = 10_000;
 
+/// Default fan-out concurrency for actor -> inbox resolution.
+///
+/// [`Outbox::resolve_inboxes`](crate::Outbox::resolve_inboxes)
+/// drives this many simultaneous actor fetches when expanding a
+/// recipient list. Sized **independently** of
+/// [`DEFAULT_DELIVERY_CONCURRENCY`] because resolution is a
+/// lightweight `GET` + policy check whereas delivery is a
+/// heavier signed `POST` — a 1 000-follower fan-out serialised at
+/// ~500 ms per fetch would take 8+ minutes, so resolution MUST
+/// run far more concurrently than delivery.
+pub const DEFAULT_RESOLVE_CONCURRENCY: usize = 32;
+
 /// Default user agent header (`actpub-federation/<version>`).
 #[must_use]
 pub fn default_user_agent() -> String {
@@ -228,6 +240,19 @@ pub struct FederationConfig {
     #[builder(default = DEFAULT_DELIVERY_QUEUE_CAPACITY)]
     pub delivery_queue_capacity: usize,
 
+    /// Maximum number of parallel actor resolutions driven by
+    /// [`Outbox::resolve_inboxes`](crate::Outbox::resolve_inboxes).
+    /// Defaults to [`DEFAULT_RESOLVE_CONCURRENCY`].
+    ///
+    /// Sized independently of [`Self::delivery_concurrency`]
+    /// because resolution is a cheap `GET` while delivery is a
+    /// heavier signed `POST`: a 1 000-follower fan-out at ~500 ms
+    /// per fetch would take 8+ minutes if serialised, so this
+    /// knob is what keeps fan-out latency from falling orders of
+    /// magnitude behind Mastodon's.
+    #[builder(default = DEFAULT_RESOLVE_CONCURRENCY)]
+    pub resolve_concurrency: usize,
+
     /// Freshness / replay-protection policy applied to every inbound
     /// HTTP signature by [`InboxPipeline`](crate::InboxPipeline).
     ///
@@ -286,6 +311,7 @@ impl std::fmt::Debug for FederationConfig {
             .field("http_fetch_limit", &self.http_fetch_limit)
             .field("delivery_concurrency", &self.delivery_concurrency)
             .field("delivery_queue_capacity", &self.delivery_queue_capacity)
+            .field("resolve_concurrency", &self.resolve_concurrency)
             .field("verify_policy", &self.verify_policy)
             .finish()
     }

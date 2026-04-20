@@ -31,12 +31,15 @@
 //! stops admission and awaits the worker task within a deadline.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures::StreamExt;
+use futures::stream;
 use serde_json::Value;
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use url::Url;
 
 use crate::config::FederationConfig;
@@ -173,12 +176,13 @@ where
 /// Shutdown coordinator for the outbox worker.
 ///
 /// Held behind an `Arc<ShutdownHandle>` by every [`Outbox`] clone
-/// **and nobody else**. The worker task holds a separate
-/// [`Arc<Notify>`] clone of [`Self::stop`] plus a [`Weak<Inner>`];
-/// it does **not** hold an [`Arc<ShutdownHandle>`], so the strong
-/// count of the handle exactly tracks the number of live [`Outbox`]
-/// clones. When that count reaches zero, [`Drop`] fires and
-/// signals the worker to exit.
+/// **and nobody else**. The worker task holds separate
+/// [`Arc<Notify>`] / [`Arc<AtomicBool>`] clones of the signalling
+/// primitives plus a [`Weak<Inner>`]; it does **not** hold an
+/// [`Arc<ShutdownHandle>`], so the strong count of the handle
+/// exactly tracks the number of live [`Outbox`] clones. When that
+/// count reaches zero, [`Drop`] fires and signals the worker to
+/// exit.
 struct ShutdownHandle {
     /// Wake-up signal for the worker's `select!`. Shared with the
     /// worker as [`Arc<Notify>`] so both sides refer to the same
@@ -188,6 +192,22 @@ struct ShutdownHandle {
     /// a caller signals shutdown before the worker has yet
     /// reached its `select!` arm.
     stop: Arc<Notify>,
+    /// Broadcast "worker has fully exited" signal. Used by
+    /// [`Outbox::graceful_shutdown`] callers that do **not** own
+    /// the worker `JoinHandle` (e.g. a second or third concurrent
+    /// caller when the first has been cancelled) so they still
+    /// get a true exit confirmation rather than an immediate
+    /// misleading `Ok(())`.
+    terminated: Arc<Notify>,
+    /// Companion level-triggered flag for [`Self::terminated`].
+    /// `Notify::notify_waiters` wakes only *currently-parked*
+    /// waiters and stores no permit, which loses signals racing
+    /// past the waiter's creation point. A caller observing this
+    /// flag set to `true` knows the worker has exited even if it
+    /// missed the notify edge. Readers MUST double-check the flag
+    /// *after* creating the `Notified` future, per the standard
+    /// Tokio Notify idiom.
+    terminated_flag: Arc<AtomicBool>,
     /// Worker [`JoinHandle`]. Taken by [`Drop`] as a belt-and-
     /// braces `abort` and by [`Outbox::graceful_shutdown`] to
     /// `await` a clean exit with a deadline.
@@ -200,11 +220,13 @@ impl Drop for ShutdownHandle {
         // exits. `notify_one` stores a permit if the worker is not
         // currently parked, so the signal is never lost.
         self.stop.notify_one();
-        // Second: abort as a belt-and-braces safeguard. If the
-        // worker is stuck inside a user-supplied
-        // `Deliverer::deliver`, `abort` is the only way to reclaim
-        // it — graceful shutdown should be done through
-        // [`Outbox::graceful_shutdown`] instead if this matters.
+        // Second: abort as a belt-and-braces safeguard. `Drop` is a
+        // *synchronous* path and cannot `.await` a drain, so we
+        // deliberately fall back to hard cancellation here — the
+        // `JoinSet` of in-flight deliveries inside the worker task
+        // is dropped along with it, aborting every pending POST.
+        // Callers that want drain semantics must use
+        // [`Outbox::graceful_shutdown`] instead.
         if let Ok(mut slot) = self.handle.lock()
             && let Some(h) = slot.take()
         {
@@ -257,21 +279,33 @@ where
             config,
             delivery_semaphore,
         });
-        // `stop` is stored both in `ShutdownHandle` (reached by
-        // every `Outbox` clone through the `Arc<ShutdownHandle>`)
-        // and in the worker task directly. Keeping it as its own
-        // `Arc<Notify>` — not threaded through `Arc<ShutdownHandle>`
-        // — is what lets the shutdown Arc's strong count reach
-        // zero when the last `Outbox` clone drops.
+        // Shutdown signalling primitives are stored both in
+        // `ShutdownHandle` (reached by every `Outbox` clone through
+        // the `Arc<ShutdownHandle>`) and in the worker task
+        // directly via separate `Arc` clones. Keeping the worker's
+        // references independent of `ShutdownHandle` is what lets
+        // the shutdown Arc's strong count reach zero when the last
+        // `Outbox` clone drops.
         let stop = Arc::new(Notify::new());
+        let terminated = Arc::new(Notify::new());
+        let terminated_flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(ShutdownHandle {
             stop: Arc::clone(&stop),
+            terminated: Arc::clone(&terminated),
+            terminated_flag: Arc::clone(&terminated_flag),
             handle: Mutex::new(None),
         });
         // Worker holds a `Weak<Inner>` so it cannot keep `Inner`
-        // alive past the last [`Outbox`] clone, and its own
-        // `Arc<Notify>` clone for the shutdown signal.
-        let handle = spawn_worker(Arc::downgrade(&inner), rx, tx.clone(), stop);
+        // alive past the last [`Outbox`] clone, plus its own
+        // clones of the three shutdown-signalling primitives.
+        let handle = spawn_worker(
+            Arc::downgrade(&inner),
+            rx,
+            tx.clone(),
+            stop,
+            terminated,
+            terminated_flag,
+        );
         if let Ok(mut slot) = shutdown.handle.lock() {
             *slot = Some(handle);
         }
@@ -385,26 +419,42 @@ where
         &self,
         timeout: Duration,
     ) -> Result<(), tokio::time::error::Elapsed> {
-        // Ask the worker to stop selecting new jobs. `notify_one`
-        // stores a permit if no waiter is currently parked, so
-        // the signal is retained even when this call races with
-        // the worker's first loop iteration.
+        // Ask the worker to stop admitting NEW jobs and start
+        // draining. `notify_one` stores a permit if no waiter is
+        // currently parked, so the signal is retained even when
+        // this call races with the worker's first loop iteration.
         self.shutdown.stop.notify_one();
+
+        // Resolution strategy:
+        //   - if we are the first caller, take the `JoinHandle` and
+        //     `.await` it directly;
+        //   - if another caller (possibly cancelled) has already
+        //     taken the handle, we fall through to the broadcast
+        //     `terminated` signal so a second caller still blocks
+        //     until the worker is really gone.
         let handle_opt = self
             .shutdown
             .handle
             .lock()
             .ok()
             .and_then(|mut slot| slot.take());
-        if let Some(handle) = handle_opt {
-            tokio::time::timeout(timeout, handle)
-                .await?
+
+        let terminated = Arc::clone(&self.shutdown.terminated);
+        let terminated_flag = Arc::clone(&self.shutdown.terminated_flag);
+
+        let wait = async move {
+            if let Some(handle) = handle_opt {
                 // Worker task's own JoinError (panic / cancel) is
                 // swallowed intentionally: graceful shutdown is a
                 // best-effort cleanup signal, not a reliability
                 // contract for user-supplied deliverers.
-                .ok();
-        }
+                drop(handle.await);
+                return;
+            }
+            wait_for_terminated(&terminated, &terminated_flag).await;
+        };
+
+        tokio::time::timeout(timeout, wait).await?;
         Ok(())
     }
 
@@ -417,14 +467,32 @@ where
     /// other recipient continues to be resolved. This matches the
     /// best-effort fan-out contract used by every mainstream
     /// Fediverse server.
+    ///
+    /// Resolution runs with a concurrency of
+    /// [`FederationConfig::resolve_concurrency`] via
+    /// [`futures::stream::StreamExt::buffer_unordered`]. A 1 000-
+    /// follower fan-out that would take 8+ minutes serialised
+    /// completes in seconds at the default 32-way parallelism,
+    /// matching Mastodon-class latency.
     pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> InboxResolution {
+        let concurrency = self.inner.config.resolve_concurrency.max(1);
+        let results: Vec<(Url, Result<Url, Error>)> =
+            stream::iter(recipient_actors.iter().cloned())
+                .map(|actor| async move {
+                    let result = self.resolve_one(&actor).await;
+                    (actor, result)
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
         let mut resolution = InboxResolution::default();
-        for actor_url in recipient_actors {
-            match self.resolve_one(actor_url).await {
+        for (actor, result) in results {
+            match result {
                 Ok(inbox) => {
                     resolution.inboxes.insert(inbox);
                 }
-                Err(e) => resolution.errors.push((actor_url.clone(), e)),
+                Err(e) => resolution.errors.push((actor, e)),
             }
         }
         resolution
@@ -486,39 +554,108 @@ where
     }
 }
 
+/// Blocks until the worker's phase-3 epilogue has set
+/// `terminated_flag` to `true`. Uses the standard
+/// `AtomicBool` + `Notify` double-check idiom so a worker that
+/// sets the flag between our load and the `notified()` future
+/// creation cannot be missed.
+async fn wait_for_terminated(terminated: &Notify, terminated_flag: &AtomicBool) {
+    loop {
+        if terminated_flag.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = terminated.notified();
+        if terminated_flag.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 fn spawn_worker<D, F>(
     inner: Weak<Inner<D, F>>,
     mut rx: mpsc::Receiver<DeliveryJob>,
     tx_for_retry: mpsc::Sender<DeliveryJob>,
     stop: Arc<Notify>,
+    terminated: Arc<Notify>,
+    terminated_flag: Arc<AtomicBool>,
 ) -> JoinHandle<()>
 where
     D: Deliverer + 'static,
     F: Fetcher + 'static,
 {
     tokio::spawn(async move {
+        // In-flight deliveries are tracked in a `JoinSet` instead
+        // of being fire-and-forget. This is what gives
+        // `Outbox::graceful_shutdown(timeout)` true drain
+        // semantics: when `stop` is signalled we finish the
+        // already-queued jobs AND wait for every spawned
+        // `run_one` to complete before exiting.
+        let mut in_flight = JoinSet::<()>::new();
+
+        // Phase 1 — accept new jobs.
+        //
+        // `biased` so the stop signal ALWAYS wins over a queued
+        // job when both are ready; otherwise the runtime could
+        // starve the stop signal under a busy queue. Finished
+        // `in_flight` tasks are reaped opportunistically so the
+        // `JoinSet` cannot grow unbounded while the worker is
+        // under steady-state load.
         loop {
-            let job = tokio::select! {
-                // `biased` so shutdown ALWAYS wins over a queued
-                // job when both are ready — otherwise the runtime
-                // could starve the stop signal under a busy queue.
+            tokio::select! {
                 biased;
-                () = stop.notified() => break,
-                job = rx.recv() => match job {
-                    Some(j) => j,
+                () = stop.notified() => {
+                    // Close the receiving half so future `send()`
+                    // calls on any outstanding sender fail fast
+                    // instead of silently appearing to succeed
+                    // while we are about to stop consuming.
+                    // Already-buffered jobs remain retrievable
+                    // via subsequent `rx.recv()` calls — that's
+                    // precisely the drain contract we rely on in
+                    // phase 2 below.
+                    rx.close();
+                    break;
+                }
+                maybe_job = rx.recv() => match maybe_job {
+                    Some(job) => {
+                        let Some(inner) = inner.upgrade() else { break };
+                        let tx_for_retry = tx_for_retry.clone();
+                        in_flight.spawn(async move {
+                            run_one(inner, job, tx_for_retry).await;
+                        });
+                    }
                     None => break, // all senders dropped
                 },
-            };
-            // Upgrade just long enough to hand a strong clone to
-            // the spawned task; `Weak::upgrade` returning `None`
-            // means every [`Outbox`] clone has been dropped and
-            // there is no point starting a new delivery.
+                Some(_) = in_flight.join_next(), if !in_flight.is_empty() => {}
+            }
+        }
+
+        // Phase 2 — drain already-enqueued jobs.
+        //
+        // `rx.close()` ensures no new job can be added, so this
+        // loop terminates as soon as the buffered queue is empty.
+        while let Some(job) = rx.recv().await {
             let Some(inner) = inner.upgrade() else { break };
             let tx_for_retry = tx_for_retry.clone();
-            tokio::spawn(async move {
+            in_flight.spawn(async move {
                 run_one(inner, job, tx_for_retry).await;
             });
         }
+
+        // Phase 3 — wait for every in-flight delivery to finish.
+        //
+        // Failures inside `run_one` are already logged by that
+        // function; we only consume the `JoinError`/`()` outputs
+        // so the `JoinSet` empties cleanly.
+        while in_flight.join_next().await.is_some() {}
+
+        // Broadcast completion to any caller parked inside a
+        // second `graceful_shutdown`. Order matters: set the
+        // flag FIRST so a late observer that only sees
+        // `terminated_flag == true` never misses the exit
+        // even if it arrives after `notify_waiters()` fires.
+        terminated_flag.store(true, Ordering::Release);
+        terminated.notify_waiters();
     })
 }
 
@@ -643,6 +780,26 @@ mod tests {
             .url_policy(UrlPolicy::permissive_for_tests())
             .build()
             .shared()
+    }
+
+    /// Poll-wait until `counter.load(SeqCst) >= target` or the
+    /// deadline elapses. Used by the graceful-shutdown and drain
+    /// tests to block until the `GatedDeliverer` has actually
+    /// entered `deliver()` on every enqueued job before the test
+    /// proceeds to signal shutdown — the fixed-sleep alternative
+    /// is flaky under CI scheduler pressure.
+    async fn wait_until_counter(counter: &AtomicUsize, target: usize, deadline: Duration) {
+        let deadline_at = std::time::Instant::now() + deadline;
+        loop {
+            if counter.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline_at,
+                "counter did not reach {target} within {deadline:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Poll-wait until `deliverer.calls.len() >= expected` or the
@@ -974,6 +1131,60 @@ mod tests {
         assert!(
             matches!(err, Error::PolicyViolation { .. }),
             "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_shared_inbox_at_loopback_ip_literal() {
+        // P2-N21 deepens the P0-9 regression coverage: the existing
+        // loopback test uses the hostname `localhost`, but a
+        // malicious actor could equally well advertise a raw IP
+        // literal like `http://127.0.0.1:8080/inbox`, which walks a
+        // different branch of `UrlPolicy` (hostname-parsing vs
+        // IP-address-parsing). Both branches MUST refuse the URL.
+        //
+        // Without this test, a future `UrlPolicy` refactor that
+        // only tightened the hostname path would silently regress
+        // the IP-literal path.
+        let attacker_url = "https://attacker.example/users/mallory";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            attacker_url.into(),
+            actor_with_shared_inbox(
+                attacker_url,
+                "https://attacker.example/users/mallory/inbox",
+                "http://127.0.0.1:8080/inbox",
+            ),
+        );
+        // Production-shape config: strict default `UrlPolicy`.
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+
+        let report = outbox
+            .dispatch(
+                json!({ "id": "https://sender.example/a/ip-poison", "type": "Create" }),
+                &[attacker_url.parse().unwrap()],
+            )
+            .await;
+        assert_eq!(
+            report.enqueued, 0,
+            "IP-literal loopback sharedInbox must not be enqueued",
+        );
+        assert_eq!(report.errors.len(), 1);
+        let (url, err) = &report.errors[0];
+        assert_eq!(url.as_str(), attacker_url);
+        assert!(
+            matches!(err, Error::PolicyViolation { .. }),
+            "expected PolicyViolation for loopback IP, got {err:?}",
         );
     }
 
@@ -1368,15 +1579,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graceful_shutdown_drains_queued_jobs_before_exit() {
+        // P1-N15 regression: `graceful_shutdown` MUST drain
+        // already-queued jobs before exiting, not hard-kill them.
+        //
+        // Prior to the phase-1/2/3 worker refactor, `stop.notified()`
+        // in the `biased` select immediately broke the loop the
+        // instant shutdown was signalled — any jobs sitting in the
+        // channel buffer (and any in-flight `run_one` that had
+        // been spawned) were silently dropped. On a 1 000-follower
+        // dispatch where the caller fires `graceful_shutdown(30s)`
+        // alongside a SIGTERM handler, that translates into
+        // hundreds of unsent activities.
+        //
+        // The fix is a three-phase worker:
+        //   Phase 1: accept new jobs, honour `stop` (on stop, close rx).
+        //   Phase 2: drain every remaining `rx.recv()` into `in_flight`.
+        //   Phase 3: `join_next` all in-flight deliveries.
+        // This test enqueues 5 gated jobs, calls `graceful_shutdown`
+        // with a deadline large enough for every job to complete,
+        // and asserts that all 5 `deliver` calls actually ran.
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let deliverer = Arc::new(GatedDeliverer {
+            release: Arc::clone(&release),
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        // `delivery_concurrency = 5` so every enqueued job starts
+        // its `deliver` body and parks on `release.notified()` in
+        // parallel — the test controls exactly when each finishes.
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .delivery_concurrency(5)
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcGated(Arc::clone(&deliverer)),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+
+        for i in 0..5 {
+            outbox
+                .enqueue(
+                    json!({ "id": format!("job-{i}"), "type": "Create" }),
+                    format!("https://example.com/inbox/{i}").parse().unwrap(),
+                )
+                .await;
+        }
+        // Wait until all 5 deliveries have actually entered
+        // `deliver()` so we KNOW they are in flight, not still
+        // sitting as unconsumed `DeliveryJob`s in the channel.
+        wait_until_counter(&started, 5, Duration::from_secs(2)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            5,
+            "all 5 jobs must have started before shutdown is requested",
+        );
+
+        // Request shutdown and *concurrently* release the gate so
+        // the in-flight deliveries can finish. A correctly-draining
+        // worker awaits `join_next` on the `JoinSet`, so it only
+        // exits after all 5 `finished` counters have incremented.
+        let shutdown_fut = outbox.graceful_shutdown(Duration::from_secs(5));
+        let release_fut = async {
+            // Small delay to ensure shutdown has entered the
+            // drain/join phase before we flip the gate; releasing
+            // too early would let the pre-shutdown path complete
+            // and miss the regression this test guards.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release.notify_waiters();
+        };
+        let (shutdown_result, ()) = tokio::join!(shutdown_fut, release_fut);
+        shutdown_result.expect("graceful_shutdown must succeed within 5s");
+
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            5,
+            "graceful_shutdown returned without draining every in-flight \
+             job — phase-3 `join_next` regressed",
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_second_caller_waits_for_worker_exit() {
+        // P1-N16 regression: a second `graceful_shutdown` caller
+        // (arriving after the first caller has already taken the
+        // `JoinHandle` out of the slot) must still BLOCK until the
+        // worker actually exits, not return an immediate misleading
+        // `Ok(())`.
+        //
+        // Before the `terminated` / `terminated_flag` pair was
+        // added, the second caller's `slot.take()` produced `None`
+        // and the function fell straight through to `Ok(())`, so a
+        // SIGTERM handler that raced two shutdown requests could
+        // plausibly `std::process::exit` while deliveries were
+        // still in flight.
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let deliverer = Arc::new(GatedDeliverer {
+            release: Arc::clone(&release),
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let outbox = Arc::new(Outbox::new(
+            ArcGated(Arc::clone(&deliverer)),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            test_config(),
+        ));
+        outbox
+            .enqueue(
+                json!({ "id": "in-flight", "type": "Create" }),
+                "https://example.com/inbox/a".parse().unwrap(),
+            )
+            .await;
+        // Wait for the deliverer to park on the gate.
+        wait_until_counter(&started, 1, Duration::from_secs(2)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        // Caller A starts shutdown but we simulate its cancellation
+        // by manually stealing the handle (this is the scenario the
+        // real code path hits when an outer `tokio::select!` picks
+        // a sibling branch before Caller A's `await` resolves).
+        let stolen_handle = outbox
+            .shutdown
+            .handle
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handle present for caller A");
+        // Caller A's side effect that DID run: the stop signal.
+        outbox.shutdown.stop.notify_one();
+
+        // Caller B comes in. Its `slot.take()` returns `None` so
+        // it must fall into the `terminated` wait path. It must
+        // not return before the worker's phase-3 epilogue fires.
+        let outbox_b = Arc::clone(&outbox);
+        let caller_b = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            outbox_b
+                .graceful_shutdown(Duration::from_secs(5))
+                .await
+                .expect("second caller must also observe a clean exit");
+            start.elapsed()
+        });
+
+        // Short sleep: if the bug is present, `caller_b` returns
+        // immediately with an elapsed time on the order of a few
+        // microseconds — while the worker is still parked on the
+        // gate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !caller_b.is_finished(),
+            "second caller returned before worker exited — P1-N16 regressed",
+        );
+
+        // Now unblock the worker and also drain the stolen handle
+        // so no tokio task leaks.
+        release.notify_waiters();
+        drop(tokio::time::timeout(Duration::from_secs(2), stolen_handle).await);
+        let elapsed = tokio::time::timeout(Duration::from_secs(2), caller_b)
+            .await
+            .expect("second caller did not return within 2s after release")
+            .expect("second caller task panicked");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "second caller returned in {elapsed:?}, not after the worker \
+             actually finished — suspicious",
+        );
+    }
+
+    #[tokio::test]
     async fn dropping_last_outbox_clone_aborts_worker() {
-        // P1-N10 regression: when every [`Outbox`] clone drops,
-        // the `ShutdownHandle` Arc's strong count goes to zero,
-        // its `Drop` fires, and the worker is aborted. Before
-        // this refactor the worker held an `Arc<Inner>` through
-        // which `Inner.tx` kept the channel open forever, so the
-        // worker leaked. We verify the handle is actually
-        // cancelled within a short deadline after the last clone
-        // drops -- no timeout means the bug has regressed.
+        // P1-N10 + P2-N19 regression: when every [`Outbox`] clone
+        // drops, the `ShutdownHandle` Arc's strong count goes to
+        // zero, its `Drop` fires, the worker is signalled via
+        // `stop.notify_one()`, and the worker task must actually
+        // exit within a short deadline.
+        //
+        // Prior to the P1-N10 refactor the worker held an
+        // `Arc<Inner>` containing the sole `tx`, so the channel
+        // never closed and the worker leaked indefinitely.
+        //
+        // The earlier (P2-N19) version of this test only asserted
+        // `Arc::strong_count == 1`, which is a *scheduling-order
+        // proxy* — it said nothing about whether the worker task
+        // had actually run its epilogue. We now steal the
+        // `JoinHandle` **before** dropping the `Outbox`, then
+        // directly `.await` the handle under a tight
+        // `tokio::time::timeout`. The steal makes `Drop::drop`'s
+        // `slot.take()` return `None` so its `abort()` branch is
+        // skipped — meaning a pass here proves the worker exited
+        // via the graceful `stop.notify_one()` path, NOT via the
+        // belt-and-braces abort.
         let release = Arc::new(Notify::new());
         let started = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
@@ -1394,27 +1800,35 @@ mod tests {
             test_config(),
         );
 
-        // Take a raw handle clone *before* dropping the outbox so
-        // we can await its exit. `shutdown.handle` is `Mutex<Option<JoinHandle>>`;
-        // we call `.take()` only inside `graceful_shutdown` /
-        // `Drop`, not here.
-        let shutdown = Arc::clone(&outbox.shutdown);
+        // Steal the worker's JoinHandle so Drop::drop cannot abort
+        // it; we want to observe the graceful-notify exit path
+        // deterministically.
+        let stolen_handle = outbox
+            .shutdown
+            .handle
+            .lock()
+            .unwrap()
+            .take()
+            .expect("worker handle should still be present");
+        let terminated_flag = Arc::clone(&outbox.shutdown.terminated_flag);
+
         drop(outbox);
 
-        // Arc strong count goes to zero -> Drop runs -> abort().
-        // The worker's `JoinHandle` is taken out and aborted by
-        // Drop itself, so observing `is_finished` on a *second*
-        // clone of the handle isn't possible. Instead we poll
-        // Arc::strong_count and assert that nobody else holds the
-        // ShutdownHandle; the Drop has already fired if we got
-        // here without the test hanging.
-        assert_eq!(
-            Arc::strong_count(&shutdown),
-            1,
-            "only the test should hold the shutdown handle after the last Outbox drop",
+        // The worker MUST observe `stop.notify_one()` emitted by
+        // ShutdownHandle::drop and exit within the deadline. 2s is
+        // wildly generous for a worker that has no in-flight jobs.
+        let join_result = tokio::time::timeout(Duration::from_secs(2), stolen_handle).await;
+        assert!(
+            join_result.is_ok(),
+            "worker did not exit within 2s after last Outbox drop — \
+             graceful-notify path regressed",
         );
-        // Sanity: the worker task is no longer able to accept
-        // jobs because its channel sender was dropped.
+        assert!(
+            terminated_flag.load(Ordering::Acquire),
+            "worker exited but did not mark `terminated_flag` true — \
+             the phase-3 epilogue is not running",
+        );
+
         let () = release.notify_waiters(); // unblock in-flight if any
     }
 }
