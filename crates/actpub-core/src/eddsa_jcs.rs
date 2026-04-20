@@ -234,7 +234,51 @@ pub fn verify(
     verifying_key: &Ed25519PublicKey,
     options: &VerifyOptions<'_>,
 ) -> Result<(), Error> {
-    let proof = signed_document.get("proof").ok_or(Error::MissingProof)?;
+    let proof_node = signed_document.get("proof").ok_or(Error::MissingProof)?;
+    match proof_node {
+        Value::Object(_) => {
+            verify_single_proof(signed_document, proof_node, verifying_key, options)
+        }
+        Value::Array(chain) => {
+            // FEP-8b32 / W3C VC-DI §4.2 proof sets: every proof in
+            // the array must validate against the same document
+            // under the caller's constraints. Missing / mixed-shape
+            // entries are rejected so a silently-dropped bogus
+            // proof cannot hide behind a single valid sibling.
+            if chain.is_empty() {
+                return Err(Error::InvalidProofField {
+                    field: "proof",
+                    reason: "proof chain is empty".to_owned(),
+                });
+            }
+            for entry in chain {
+                if !entry.is_object() {
+                    return Err(Error::InvalidProofField {
+                        field: "proof",
+                        reason: "proof chain entries must be objects".to_owned(),
+                    });
+                }
+                verify_single_proof(signed_document, entry, verifying_key, options)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::InvalidProofField {
+            field: "proof",
+            reason: "must be an object or an array of objects".to_owned(),
+        }),
+    }
+}
+
+/// Verifies ONE proof block against the document under
+/// `options`. Factored out so [`verify`] can loop over a FEP-8b32
+/// proof chain without duplicating the binding / hash / signature
+/// pipeline.
+fn verify_single_proof(
+    signed_document: &Value,
+    proof: &Value,
+    verifying_key: &Ed25519PublicKey,
+    options: &VerifyOptions<'_>,
+) -> Result<(), Error> {
     let raw_signature = decode_proof_value(proof)?;
 
     check_proof_header(proof)?;
@@ -325,16 +369,7 @@ fn check_created_timestamp(
             field: "created",
             reason: "missing or non-string".to_owned(),
         })?;
-    // FEP-8b32 defers to XSD `dateTime`, but the cryptosuite
-    // explicitly writes ISO-8601 / RFC 3339 seconds-precision in the
-    // serialiser. Accepting both here so older peers that emit
-    // fractional seconds still verify.
-    let created = DateTime::parse_from_rfc3339(raw)
-        .map_err(|e| Error::InvalidProofField {
-            field: "created",
-            reason: format!("not a valid RFC 3339 timestamp: {e}"),
-        })?
-        .with_timezone(&Utc);
+    let created = parse_created_timestamp(raw)?;
 
     if let Some(skew) = max_skew_future
         && created > now + skew
@@ -347,6 +382,42 @@ fn check_created_timestamp(
         return Err(Error::ProofTimestampTooOld { created, now });
     }
     Ok(())
+}
+
+/// Parses a FEP-8b32 `created` timestamp.
+///
+/// FEP-8b32 defers to `xsd:dateTime`, whose lexical space **allows
+/// timezone to be omitted** (unqualified instants are treated as
+/// local to the publisher). The W3C VC-DI cryptosuite adds a
+/// preference for RFC 3339 / ISO 8601 with a trailing `Z`, and our
+/// signer emits that form. Interop forces us to parse both:
+///
+/// 1. **RFC 3339** (`2026-04-20T10:00:00Z`, `…+00:00`): the cryptosuite
+///    canonical form — tried first and accepted as-is.
+/// 2. **XSD `dateTime` with no timezone** (`2026-04-20T10:00:00`,
+///    optionally with fractional seconds): interpreted as UTC so
+///    the downstream freshness window has a deterministic anchor,
+///    matching `Fedify` / `SpaceBar`'s historical behaviour.
+///
+/// Any other shape is rejected with a descriptive error so a peer
+/// sending a timezone-free local timestamp does not silently slip
+/// past the freshness gate under an incorrect offset assumption.
+fn parse_created_timestamp(raw: &str) -> Result<DateTime<Utc>, Error> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    for fmt in &["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, fmt) {
+            return Ok(naive.and_utc());
+        }
+    }
+    Err(Error::InvalidProofField {
+        field: "created",
+        reason: format!(
+            "`{raw}` is neither an RFC 3339 timestamp nor a timezone-less \
+             XSD dateTime"
+        ),
+    })
 }
 
 fn build_proof_config(unsigned_document: &Value, options: &ProofOptions) -> Value {
@@ -813,5 +884,101 @@ mod tests {
         let err = verify(&signed, &key.public_key(), &opts)
             .expect_err("future-dated created must be rejected");
         assert!(matches!(err, Error::ProofTimestampInFuture { .. }));
+    }
+
+    #[test]
+    fn verify_accepts_proof_chain_of_two_valid_proofs() {
+        // P1-N4 regression: FEP-8b32 / W3C VC-DI §4.2 proof sets —
+        // when `proof` is an ARRAY, every entry must validate. The
+        // verifier used to only index into `proof.proofValue`,
+        // which returns `None` on an array and aborted with
+        // `InvalidProofValue` before even looking at the entries.
+        let key = Ed25519SigningKey::generate().unwrap();
+        // Build two independent proofs of the same document by
+        // signing twice with the SAME key and the SAME options —
+        // `eddsa-jcs-2022` is deterministic, so both proofs carry
+        // identical proofValue bytes, which is fine for this test
+        // (both will validate).
+        let signed_a = sign(&sample_create(), &fixed_options(), &key).unwrap();
+        let proof_a = signed_a["proof"].clone();
+        let mut signed_chain = sample_create();
+        signed_chain["proof"] = Value::Array(vec![proof_a.clone(), proof_a]);
+
+        let vm = fixed_vm();
+        verify(&signed_chain, &key.public_key(), &test_opts(&vm))
+            .expect("a chain of two identical valid proofs must verify");
+    }
+
+    #[test]
+    fn verify_rejects_proof_chain_with_one_bogus_proof() {
+        // P1-N4 regression: a chain is only valid if EVERY entry
+        // validates. A silently-dropped bogus sibling must not
+        // hide behind a valid one.
+        let key = Ed25519SigningKey::generate().unwrap();
+        let signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
+        let valid_proof = signed["proof"].clone();
+        let mut bogus_proof = valid_proof.clone();
+        // Mutate proofValue to a syntactically valid but
+        // semantically wrong signature.
+        bogus_proof["proofValue"] = json!("z11111111111111111111111111111");
+
+        let mut signed_chain = sample_create();
+        signed_chain["proof"] = Value::Array(vec![valid_proof, bogus_proof]);
+
+        let vm = fixed_vm();
+        let err = verify(&signed_chain, &key.public_key(), &test_opts(&vm))
+            .expect_err("chain with a bogus proof must be rejected");
+        // The bogus proofValue fails signature math or the length /
+        // multibase check — either surfaces as a rejection.
+        assert!(
+            matches!(err, Error::SignatureMismatch | Error::InvalidProofValue(_)),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[test]
+    fn verify_rejects_empty_proof_chain() {
+        let key = Ed25519SigningKey::generate().unwrap();
+        let mut signed = sample_create();
+        signed["proof"] = Value::Array(vec![]);
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("empty proof chain must be rejected");
+        assert!(matches!(err, Error::InvalidProofField { field, .. } if field == "proof"));
+    }
+
+    #[test]
+    fn parse_created_accepts_rfc3339_with_z() {
+        let parsed = parse_created_timestamp("2026-04-20T10:00:00Z").unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2026, 4, 20, 10, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_created_accepts_xsd_datetime_without_timezone() {
+        // P1-N5 regression: `xsd:dateTime` lexical space allows
+        // omitting the timezone. Fedify and SpaceBar have been
+        // observed emitting timezone-less timestamps; rejecting
+        // them would break interop for no security gain.
+        let parsed = parse_created_timestamp("2026-04-20T10:00:00").unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2026, 4, 20, 10, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_created_accepts_xsd_datetime_with_fractional_seconds_no_tz() {
+        let parsed = parse_created_timestamp("2026-04-20T10:00:00.123").unwrap();
+        // Second-precision equality: the 123 ms sub-second part
+        // is carried forward but does not influence the freshness
+        // window, which is measured in seconds or coarser.
+        let expected = Utc.with_ymd_and_hms(2026, 4, 20, 10, 0, 0).unwrap();
+        assert_eq!(
+            parsed.signed_duration_since(expected).num_milliseconds(),
+            123,
+        );
+    }
+
+    #[test]
+    fn parse_created_rejects_garbage() {
+        let err = parse_created_timestamp("not a date").expect_err("garbage must fail");
+        assert!(matches!(err, Error::InvalidProofField { field, .. } if field == "created"));
     }
 }

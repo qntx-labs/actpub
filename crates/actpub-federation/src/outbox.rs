@@ -364,26 +364,16 @@ where
 {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            // Acquire one permit *in the dispatcher* so the
-            // concurrency ceiling creates backpressure on the
-            // receive side too: when every permit is in flight the
-            // dispatcher blocks here instead of spawning yet
-            // another task. `Semaphore::close` during shutdown
-            // would surface as `AcquireError`; in that case we log
-            // once and drop the remaining queue.
-            let Ok(permit) = Arc::clone(&inner.delivery_semaphore).acquire_owned().await else {
-                tracing::error!(
-                    target: "actpub::outbox",
-                    "delivery semaphore closed; draining queued jobs",
-                );
-                break;
-            };
+            // Detach every job to its own task *without* holding a
+            // semaphore permit here. The permit is acquired inside
+            // `run_one`, **after** the retry backoff sleep, so a
+            // Mastodon-class 5-minute backoff cannot stall the
+            // dispatcher or starve sibling deliveries. Backpressure
+            // at the receive side is the responsibility of a
+            // bounded channel (see P1 follow-up); the semaphore's
+            // job is solely to cap *in-flight network* fan-out.
             let job_inner = Arc::clone(&inner);
             tokio::spawn(async move {
-                // Hold the permit for the duration of
-                // `run_one`; dropping it on exit releases a slot
-                // back to the dispatcher.
-                let _permit = permit;
                 run_one(job_inner, job).await;
             });
         }
@@ -395,10 +385,26 @@ where
     D: Deliverer,
     F: Fetcher,
 {
+    // Back off BEFORE touching the permit: retry sleeps can span
+    // tens of minutes under `RetryPolicy::mastodon`, and holding a
+    // permit across them would drain `delivery_concurrency` to
+    // zero under even a modest stream of transient failures.
     let delay = inner.retry_policy.delay_before_retry(job.attempt);
     if delay > Duration::ZERO {
         tokio::time::sleep(delay).await;
     }
+    // Acquire one permit only for the actual deliver call. A
+    // `Semaphore::close` during shutdown surfaces here; we bail out
+    // instead of holding the job forever, and the retry path is
+    // lost because the process is going away anyway.
+    let Ok(permit) = Arc::clone(&inner.delivery_semaphore).acquire_owned().await else {
+        tracing::error!(
+            target: "actpub::outbox",
+            "delivery semaphore closed; dropping in-flight job",
+        );
+        return;
+    };
+    let _permit = permit;
     let DeliveryJob {
         activity,
         inbox,
@@ -882,6 +888,141 @@ mod tests {
         async fn deliver(&self, a: &Value, i: &Url) -> Result<(), Error> {
             self.0.deliver(a, i).await
         }
+    }
+
+    /// Deliverer that succeeds on some inboxes and fails forever on
+    /// others, notifying the test when the first success completes.
+    /// Used by the P0-R2 regression test to distinguish the
+    /// "retry-sleep holds permit" bug from the fixed behaviour.
+    struct SplitDeliverer {
+        ok_delivered: tokio::sync::Notify,
+        ok_deliver_at: Mutex<Option<std::time::Instant>>,
+    }
+
+    impl SplitDeliverer {
+        fn new() -> Self {
+            Self {
+                ok_delivered: tokio::sync::Notify::new(),
+                ok_deliver_at: Mutex::new(None),
+            }
+        }
+    }
+
+    impl Deliverer for SplitDeliverer {
+        async fn deliver(&self, _activity: &Value, inbox: &Url) -> Result<(), Error> {
+            if inbox.as_str().contains("fail") {
+                return Err(Error::Status {
+                    url: inbox.clone(),
+                    status: 503,
+                });
+            }
+            *self.ok_deliver_at.lock().unwrap() = Some(std::time::Instant::now());
+            self.ok_delivered.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct ArcSplit(Arc<SplitDeliverer>);
+    impl Deliverer for ArcSplit {
+        async fn deliver(&self, a: &Value, i: &Url) -> Result<(), Error> {
+            self.0.deliver(a, i).await
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_sleep_does_not_hold_delivery_permit() {
+        // P0-R2 regression: a delivery that enters retry backoff
+        // MUST release its semaphore permit across the sleep,
+        // otherwise a trickle of transient failures would drain
+        // `delivery_concurrency` to zero for the full backoff
+        // window (5+ minutes under `RetryPolicy::mastodon`).
+        //
+        // Setup: `delivery_concurrency = 1`, retry delay = 400 ms.
+        // We dispatch a job that fails forever, wait 50 ms for its
+        // attempt-0 failure and the enqueue of attempt-1, then
+        // dispatch a second job that succeeds. With the permit
+        // correctly released during the sleep, the second job
+        // delivers ~immediately. With the old bug (permit held),
+        // it would wait up to ~400 ms.
+        //
+        // Assertion threshold = 200 ms: comfortably below 400 ms
+        // but generous enough to tolerate scheduler noise on slow
+        // CI.
+        use std::time::Instant;
+
+        let fail_actor = "https://example.com/users/fail";
+        let ok_actor = "https://example.com/users/ok";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            fail_actor.to_owned(),
+            actor_with_inbox(fail_actor, "https://example.com/fail-inbox"),
+        );
+        actors.insert(
+            ok_actor.to_owned(),
+            actor_with_inbox(ok_actor, "https://example.com/ok-inbox"),
+        );
+
+        let deliverer = Arc::new(SplitDeliverer::new());
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(400),
+            max_delay: Duration::from_millis(400),
+            multiplier: 1.0,
+            max_retries: 5,
+        };
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .delivery_concurrency(1)
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcSplit(Arc::clone(&deliverer)),
+            StaticFetcher { actors },
+            policy,
+            cfg,
+        );
+
+        // Enqueue the failing job first; its attempt-0 deliver
+        // fails immediately with no network, so within 50 ms the
+        // retry for attempt-1 is queued and the worker has entered
+        // its 400 ms sleep.
+        outbox
+            .dispatch(
+                json!({ "id": "https://sender.example/a/fail", "type": "Create" }),
+                &[fail_actor.parse().unwrap()],
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Measure ok latency from this point: if the bug is back,
+        // the ok deliver blocks on the permit until the 400 ms
+        // retry sleep elapses.
+        let t_dispatch = Instant::now();
+        outbox
+            .dispatch(
+                json!({ "id": "https://sender.example/a/ok", "type": "Create" }),
+                &[ok_actor.parse().unwrap()],
+            )
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_millis(350),
+            deliverer.ok_delivered.notified(),
+        )
+        .await
+        .expect("ok deliver must complete before the 400 ms retry sleep elapses");
+        let ok_latency = deliverer
+            .ok_deliver_at
+            .lock()
+            .unwrap()
+            .expect("SplitDeliverer recorded the ok timestamp")
+            - t_dispatch;
+        assert!(
+            ok_latency < Duration::from_millis(200),
+            "ok deliver took {ok_latency:?}; suggests the retry sleep is \
+             still holding the delivery permit",
+        );
     }
 
     #[tokio::test]

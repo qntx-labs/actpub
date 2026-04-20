@@ -181,9 +181,14 @@ where
     /// shares `config` for caching and policy.
     #[must_use]
     pub fn new(fetcher: F, handler: H, config: Arc<FederationConfig>) -> Self {
+        // Size the replay-dedup cache from `dedup_capacity` / `dedup_ttl`,
+        // NOT from the actor-fetch cache. They serve different purposes
+        // (see `FederationConfig`) and must be tuned independently — a
+        // small fetch cache is harmless, a small dedup cache shrinks the
+        // replay-protection window below `verify_policy.max_age`.
         let seen = Cache::builder()
-            .max_capacity(config.cache_capacity.max(1))
-            .time_to_live(config.cache_ttl)
+            .max_capacity(config.dedup_capacity.max(1))
+            .time_to_live(config.dedup_ttl)
             .build();
         Self {
             inner: Arc::new(Inner {
@@ -340,6 +345,11 @@ fn enforce_actor_domain_matches_key_id(actor: &Value, key_id: &str) -> Result<()
     }
 }
 
+const DIGEST_ALGS: &[actpub_httpsig::DigestAlgorithm] = &[
+    actpub_httpsig::DigestAlgorithm::Sha256,
+    actpub_httpsig::DigestAlgorithm::Sha512,
+];
+
 fn verify_body_integrity(parts: &http::request::Parts, body: &[u8]) -> Result<(), Error> {
     let digest_header = parts
         .headers
@@ -353,15 +363,25 @@ fn verify_body_integrity(parts: &http::request::Parts, body: &[u8]) -> Result<()
         .map(str::to_owned);
 
     match (content_digest_header, digest_header) {
-        (Some(cd), _) => {
-            verify_any_content_digest_header(
-                &cd,
-                body,
-                &[
-                    actpub_httpsig::DigestAlgorithm::Sha256,
-                    actpub_httpsig::DigestAlgorithm::Sha512,
-                ],
-            )?;
+        // Mastodon (and a few other peers) emit *both* `Digest` and
+        // `Content-Digest` on every inbox POST, and a Cavage signer
+        // configured with either header name will bind only one of
+        // them into the signature base. If we only verified
+        // `Content-Digest` and the peer's Cavage base happened to
+        // cover `Digest` instead, an attacker could swap out the
+        // body, recompute `Content-Digest`, and leave the signed
+        // `Digest` unchanged — the signature would still verify
+        // (because `Digest` is in the base) but the body / digest
+        // binding would be broken. Requiring *both* headers to
+        // hash-match the body closes that gap regardless of which
+        // header the signer chose.
+        (Some(cd), Some(d)) => {
+            verify_any_content_digest_header(&cd, body, DIGEST_ALGS)?;
+            verify_digest_header(&d, body).map_err(Error::from)?;
+            Ok(())
+        }
+        (Some(cd), None) => {
+            verify_any_content_digest_header(&cd, body, DIGEST_ALGS)?;
             Ok(())
         }
         (None, Some(d)) => {
@@ -573,12 +593,15 @@ mod tests {
             .shared()
     }
 
-    /// Build a signed inbox POST: returns (parts, body) plus the
-    /// public key the receiver MUST resolve to verify.
-    fn signed_inbox_request(activity: &Value) -> (http::request::Parts, Bytes, VerifyingKey) {
+    /// Build a signed inbox POST using a caller-supplied key. Keeps
+    /// `signed_inbox_request` a one-liner and lets tests that need
+    /// multiple sibling activities under the same actor reuse one
+    /// key pair.
+    fn signed_inbox_request_with_key(
+        activity: &Value,
+        key: &SigningKey,
+    ) -> (http::request::Parts, Bytes) {
         let body = serde_json::to_vec(activity).unwrap();
-        let key = SigningKey::generate_ed25519();
-        let public = key.verifying_key();
         let mut req = Request::builder()
             .method(Method::POST)
             .uri("https://recv.example.com/users/bob/inbox")
@@ -595,11 +618,20 @@ mod tests {
             )
             .body(body.clone())
             .unwrap();
-        CavageSigner::new(&key, "https://send.example.com/users/alice#key")
+        CavageSigner::new(key, "https://send.example.com/users/alice#key")
             .sign(&mut req)
             .unwrap();
         let (parts, _body_vec) = req.into_parts();
-        (parts, Bytes::from(body), public)
+        (parts, Bytes::from(body))
+    }
+
+    /// Build a signed inbox POST: returns (parts, body) plus the
+    /// public key the receiver MUST resolve to verify.
+    fn signed_inbox_request(activity: &Value) -> (http::request::Parts, Bytes, VerifyingKey) {
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let (parts, body) = signed_inbox_request_with_key(activity, &key);
+        (parts, body, public)
     }
 
     fn actor_json_with_pem(key_id: &str, pem_or_multibase: &str, is_multikey: bool) -> Value {
@@ -1018,5 +1050,122 @@ mod tests {
             "urn:uuid:deadbeef",
         );
         assert_eq!(normalise_activity_id("not-a-url"), "not-a-url");
+    }
+
+    #[test]
+    fn verify_body_integrity_rejects_stale_digest_when_both_headers_present() {
+        // P0-N3 regression: when a peer emits BOTH `Digest:` and
+        // `Content-Digest:` (Mastodon's default), an attacker who
+        // tampers with the body + recomputes ONLY `Content-Digest`
+        // and leaves the signed `Digest` stale MUST be rejected.
+        // The previous implementation returned early after
+        // validating `Content-Digest`, leaving the stale `Digest`
+        // unchecked and opening a body-swap attack against Cavage
+        // signatures whose base covered `Digest` (not
+        // `Content-Digest`).
+        let original = b"{\"id\":\"https://x/a\",\"type\":\"Create\"}";
+        let tampered = b"{\"id\":\"https://x/a\",\"type\":\"Tampered\"}";
+        let fresh_content_digest =
+            content_digest_header_with(tampered, &[actpub_httpsig::DigestAlgorithm::Sha256]);
+        let stale_digest = sha256_digest_header(original);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://recv.example.com/users/bob/inbox")
+            .header("host", "recv.example.com")
+            .header("digest", stale_digest)
+            .header("content-digest", fresh_content_digest)
+            .body(())
+            .unwrap();
+        let (parts, ()) = req.into_parts();
+        let err = verify_body_integrity(&parts, tampered)
+            .expect_err("stale Digest must be rejected even if Content-Digest matches");
+        assert!(matches!(err, Error::HttpSig(_)), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn verify_body_integrity_accepts_when_both_headers_match_body() {
+        // Corollary of P0-N3: the two-header success path must
+        // still validate a correctly-signed request that sets both
+        // headers (the Mastodon baseline).
+        let body = b"{\"id\":\"https://x/a\",\"type\":\"Create\"}";
+        let cd = content_digest_header_with(body, &[actpub_httpsig::DigestAlgorithm::Sha256]);
+        let d = sha256_digest_header(body);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://recv.example.com/users/bob/inbox")
+            .header("host", "recv.example.com")
+            .header("digest", d)
+            .header("content-digest", cd)
+            .body(())
+            .unwrap();
+        let (parts, ()) = req.into_parts();
+        verify_body_integrity(&parts, body).expect("matching both headers must pass");
+    }
+
+    #[tokio::test]
+    async fn dedup_cache_is_sized_by_dedup_capacity_not_cache_capacity() {
+        // P0-R1 regression: the replay-dedup cache MUST read from
+        // `FederationConfig::dedup_capacity`/`dedup_ttl`, NOT from
+        // the actor-fetch cache fields. The previous wiring shrank
+        // the replay window by ~100x on Mastodon-class traffic.
+        //
+        // The two fields are pitted against each other: a
+        // deliberately tiny `cache_capacity = 1` (which, if it were
+        // still being read by the dedup cache, would evict every
+        // prior entry the moment a sibling arrives) and a generous
+        // `dedup_capacity = 32` (which MUST keep every sibling so
+        // the final replay is caught).
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://test/sender#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .cache_capacity(1)
+            .dedup_capacity(32)
+            .dedup_ttl(std::time::Duration::from_hours(1))
+            .build()
+            .shared();
+
+        // One key pair shared across all sibling activities so the
+        // actor JSON resolves consistently for every POST.
+        let key = SigningKey::generate_ed25519();
+        let multibase = match key.verifying_key() {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(&k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
+        let pipeline = InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), cfg);
+
+        let mut siblings = Vec::new();
+        for n in 0..4 {
+            let activity = json!({
+                "id": format!("https://send.example.com/activities/dedup-{n}"),
+                "type": "Create",
+                "actor": "https://send.example.com/users/alice"
+            });
+            let (parts, body) = signed_inbox_request_with_key(&activity, &key);
+            siblings.push((parts, body));
+        }
+        for (parts, body) in &siblings {
+            let out = pipeline.process(parts, body.clone()).await.unwrap();
+            assert!(
+                matches!(out, InboxOutcome::Accepted { .. }),
+                "unexpected first-pass outcome: {out:?}",
+            );
+        }
+        // Replay the FIRST sibling. The bugged wiring would evict
+        // it from a `cache_capacity = 1`-sized cache as soon as the
+        // second sibling arrived, and this would return `Accepted`.
+        // With the correct `dedup_capacity = 32` wiring, the
+        // activity is still remembered and the replay is caught.
+        let (parts0, body0) = &siblings[0];
+        let replay = pipeline.process(parts0, body0.clone()).await.unwrap();
+        assert!(
+            matches!(replay, InboxOutcome::Duplicate { .. }),
+            "dedup cache evicted first activity after 3 siblings; likely \
+             reading the wrong capacity field. got: {replay:?}",
+        );
     }
 }
