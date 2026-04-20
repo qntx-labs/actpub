@@ -530,7 +530,7 @@ fn sign_get_request(
     config: &FederationConfig,
 ) -> Result<reqwest::RequestBuilder, Error> {
     let mut http_req = build_signed_get_skeleton(url)?;
-    CavageSigner::new(&config.signing_key, config.key_id.as_str())
+    CavageSigner::new(config.signing_key_ref(), config.key_id.as_str())
         .with_headers(SIGNED_FETCH_HEADER_SET.iter().copied())
         .sign(&mut http_req)?;
     for (name, value) in http_req.headers() {
@@ -560,7 +560,7 @@ pub fn signed_fetch_signature_header(
     url: &Url,
 ) -> Result<String, Error> {
     let mut req = build_signed_get_skeleton(url)?;
-    CavageSigner::new(&config.signing_key, config.key_id.as_str())
+    CavageSigner::new(config.signing_key_ref(), config.key_id.as_str())
         .with_headers(SIGNED_FETCH_HEADER_SET.iter().copied())
         .sign(&mut req)?;
     Ok(req

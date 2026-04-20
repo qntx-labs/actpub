@@ -96,7 +96,7 @@ pub use self::key::{
     Algorithm, Ed25519PublicKey, Ed25519SigningKey, Multikey, RsaBits, RsaPublicKey, RsaSigningKey,
     SigningKey, VerifyingKey,
 };
-pub use self::policy::{CAVAGE_REQUIRED_HEADERS, VerifyPolicy};
+pub use self::policy::{CAVAGE_REQUIRED_HEADERS, RFC9421_REQUIRED_COMPONENTS, VerifyPolicy};
 pub use self::rfc9421::{
     Component, DEFAULT_COMPONENTS as RFC9421_DEFAULT_COMPONENTS, Rfc9421Signer, Rfc9421Verified,
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_dict, parse_signature_input_dict,

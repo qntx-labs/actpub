@@ -65,8 +65,9 @@ use tracing as _;
 use wiremock as _;
 
 pub use self::config::{
-    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL, DEFAULT_HTTP_FETCH_LIMIT,
-    DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_REQUEST_TIMEOUT, FederationConfig, default_user_agent,
+    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL, DEFAULT_DEDUP_CAPACITY, DEFAULT_DEDUP_TTL,
+    DEFAULT_DELIVERY_CONCURRENCY, DEFAULT_HTTP_FETCH_LIMIT, DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_REQUEST_TIMEOUT, FederationConfig, default_user_agent,
 };
 pub use self::deliver::{Deliverer, ReqwestDeliverer};
 pub use self::error::Error;

@@ -29,15 +29,28 @@ use crate::error::Error;
 /// implementation.
 pub const CAVAGE_REQUIRED_HEADERS: &[&str] = &["(request-target)", "host", "date"];
 
+/// Minimum RFC 9421 covered-component set every compliant verifier
+/// should enforce for POST requests.
+///
+/// `@method` and `@target-uri` together bind the signature to one
+/// concrete resource; `content-digest` chains the signature to the
+/// request body so a captured signature cannot be replayed against a
+/// different payload. RFC 9421 §7.2.1 ("Choosing Signature Components")
+/// recommends exactly this triple for POST requests carrying a body,
+/// and every mainstream Fediverse implementation we have seen on the
+/// wire includes at least these three components.
+pub const RFC9421_REQUIRED_COMPONENTS: &[&str] = &["@method", "@target-uri", "content-digest"];
+
 /// Tunables governing which signed requests are accepted at
 /// verification time.
 ///
 /// A `max_age` of `None` disables the past-side check and a
 /// `max_clock_skew_future` of `None` disables the future-side check;
 /// both default to `Some(...)` in the presets. `cavage_required_headers`
-/// defaults to [`CAVAGE_REQUIRED_HEADERS`], and `allow_multiple_signatures`
-/// defaults to `false` — callers that need the historical permissive
-/// behaviour can flip either knob.
+/// defaults to [`CAVAGE_REQUIRED_HEADERS`], `rfc9421_required_components`
+/// defaults to [`RFC9421_REQUIRED_COMPONENTS`], and
+/// `allow_multiple_signatures` defaults to `false` — callers that need
+/// the historical permissive behaviour can flip any of these knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VerifyPolicy {
@@ -64,6 +77,16 @@ pub struct VerifyPolicy {
     /// case-insensitively.
     pub cavage_required_headers: &'static [&'static str],
 
+    /// RFC 9421-specific: the list of component identifiers whose
+    /// presence in the `Signature-Input:` inner list is mandatory.
+    /// Matches the spelling returned by
+    /// [`Component::identifier`](crate::Component::identifier) —
+    /// derived components are written with a leading `@`
+    /// (e.g. `"@method"`, `"@target-uri"`), header components
+    /// appear lower-cased (e.g. `"content-digest"`). Names are
+    /// compared case-insensitively.
+    pub rfc9421_required_components: &'static [&'static str],
+
     /// If `false` (the default), a `Signature-Input:` header containing
     /// more than one label is rejected outright. Mastodon and the RFC
     /// 9421 interop profile both expect exactly one signature per
@@ -76,7 +99,7 @@ pub struct VerifyPolicy {
 impl VerifyPolicy {
     /// Returns the policy Mastodon applies to inbound federated
     /// requests: 12 hours past, 5 minutes future, timestamps optional,
-    /// and the Cavage minimum header set enforced.
+    /// and the Cavage / RFC 9421 minimum component sets enforced.
     ///
     /// See <https://docs.joinmastodon.org/spec/security/>.
     #[must_use]
@@ -86,14 +109,15 @@ impl VerifyPolicy {
             max_clock_skew_future: Some(Duration::minutes(5)),
             require_timestamp: false,
             cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            rfc9421_required_components: RFC9421_REQUIRED_COMPONENTS,
             allow_multiple_signatures: false,
         }
     }
 
     /// Returns a tight policy appropriate for internal services where
     /// every hop has NTP-synchronised clocks: 5 minutes past, 1 minute
-    /// future, timestamps mandatory, Cavage minimum header set
-    /// enforced, and multi-signature requests rejected.
+    /// future, timestamps mandatory, Cavage / RFC 9421 minimum
+    /// component sets enforced, and multi-signature requests rejected.
     #[must_use]
     pub const fn strict() -> Self {
         Self {
@@ -101,15 +125,18 @@ impl VerifyPolicy {
             max_clock_skew_future: Some(Duration::minutes(1)),
             require_timestamp: true,
             cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            rfc9421_required_components: RFC9421_REQUIRED_COMPONENTS,
             allow_multiple_signatures: false,
         }
     }
 
-    /// Returns a policy that **disables** freshness checking entirely.
+    /// Returns a policy that **disables** freshness and
+    /// required-component checking entirely.
     ///
     /// Only intended for byte-level conformance tests against static
-    /// RFC 9421 / Cavage fixtures that bake fixed timestamps into their
-    /// inputs. Do not use in production.
+    /// RFC 9421 / Cavage fixtures that bake fixed timestamps and
+    /// minimal component lists into their inputs. Do not use in
+    /// production.
     #[must_use]
     pub const fn no_freshness_check() -> Self {
         Self {
@@ -117,6 +144,7 @@ impl VerifyPolicy {
             max_clock_skew_future: None,
             require_timestamp: false,
             cavage_required_headers: CAVAGE_REQUIRED_HEADERS,
+            rfc9421_required_components: &[],
             allow_multiple_signatures: false,
         }
     }

@@ -6,7 +6,7 @@ use http::Request;
 use crate::error::Error;
 use crate::key::{Algorithm, VerifyingKey};
 use crate::policy::VerifyPolicy;
-use crate::rfc9421::components::build_signature_base;
+use crate::rfc9421::components::{Component, build_signature_base};
 use crate::rfc9421::signature::{SIGNATURE_HEADER, parse_signature_dict};
 use crate::rfc9421::signature_input::{
     SIGNATURE_INPUT_HEADER, SignatureInput, parse_signature_input_dict,
@@ -118,6 +118,19 @@ where
             continue;
         };
 
+        // Cheapest-possible replay guard: reject signatures whose
+        // covered-component set omits any identifier in
+        // `policy.rfc9421_required_components` before any crypto
+        // work runs. A signature that does not cover `@method` /
+        // `@target-uri` / `content-digest` can be replayed against
+        // a different path, method, or body.
+        if let Err(e) =
+            enforce_required_components(&input.components, policy.rfc9421_required_components)
+        {
+            last_err = Some(e);
+            continue;
+        }
+
         // Freshness check on a per-label basis so that one rotated
         // label does not invalidate a sibling signature.
         if let Err(e) = policy.check(input.created, input.expires, date_header.as_deref(), now) {
@@ -176,6 +189,22 @@ fn parse_alg_hint(hint: &str) -> Result<Option<Algorithm>, Error> {
         "ed25519" => Ok(Some(Algorithm::Ed25519)),
         other => Err(Error::UnsupportedAlgorithm(other.to_owned())),
     }
+}
+
+/// Rejects the signature when `signed` is missing any identifier in
+/// `required`. Identifiers are matched case-insensitively against
+/// [`Component::identifier`], so a policy entry `"content-digest"`
+/// matches any casing the signer emitted.
+fn enforce_required_components(signed: &[Component], required: &[&str]) -> Result<(), Error> {
+    for needed in required {
+        let present = signed
+            .iter()
+            .any(|c| c.identifier().eq_ignore_ascii_case(needed));
+        if !present {
+            return Err(Error::RequiredHeaderAbsent((*needed).to_owned()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -333,6 +362,115 @@ mod tests {
             |_| Ok(public.clone()),
         )
         .expect("the valid sig1 label must still verify");
+    }
+
+    #[test]
+    fn mastodon_policy_rejects_signature_without_target_uri_component() {
+        // A signature covering `@method` + `content-digest` but not
+        // `@target-uri` can be replayed verbatim against a different
+        // path on the same server; the policy MUST cut it off before
+        // any crypto work runs.
+        use chrono::DateTime;
+
+        use crate::rfc9421::Component;
+
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let body = b"{}";
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/inbox?a=1")
+            .header("host", "example.com")
+            .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
+            .header("content-digest", content_digest_header(body))
+            .body(body.to_vec())
+            .expect("valid");
+        Rfc9421Signer::new(&key, "kid")
+            .with_components(vec![
+                Component::Method,
+                Component::Header("content-digest".into()),
+            ])
+            .with_created(1_700_000_000)
+            .sign(&mut req)
+            .expect("sign");
+
+        let err = rfc9421_verify_with_policy(
+            &req,
+            &VerifyPolicy::mastodon(),
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            |_| Ok(public.clone()),
+        )
+        .expect_err("missing `@target-uri` must be rejected by the Mastodon policy");
+        assert!(
+            matches!(&err, Error::RequiredHeaderAbsent(name) if name == "@target-uri"),
+            "unexpected error variant: {err:?}",
+        );
+    }
+
+    #[test]
+    fn mastodon_policy_rejects_signature_without_content_digest_component() {
+        // Same shape as the previous test but the covered set now
+        // omits `content-digest`: an intermediary could replay the
+        // signed `@method` + `@target-uri` against a different body.
+        use chrono::DateTime;
+
+        use crate::rfc9421::Component;
+
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let body = b"{}";
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/inbox?a=1")
+            .header("host", "example.com")
+            .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
+            .header("content-digest", content_digest_header(body))
+            .body(body.to_vec())
+            .expect("valid");
+        Rfc9421Signer::new(&key, "kid")
+            .with_components(vec![Component::Method, Component::TargetUri])
+            .with_created(1_700_000_000)
+            .sign(&mut req)
+            .expect("sign");
+
+        let err = rfc9421_verify_with_policy(
+            &req,
+            &VerifyPolicy::mastodon(),
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            |_| Ok(public.clone()),
+        )
+        .expect_err("missing `content-digest` must be rejected");
+        assert!(
+            matches!(&err, Error::RequiredHeaderAbsent(name) if name == "content-digest"),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[test]
+    fn no_freshness_check_policy_tolerates_minimal_covered_components() {
+        // Byte-level conformance tests against static RFC 9421
+        // fixtures may exercise sparse inner lists; the
+        // freshness-disabled preset MUST also disable the
+        // required-components gate so those fixtures still verify.
+        use crate::rfc9421::Component;
+
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let body = b"{}";
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/inbox")
+            .header("host", "example.com")
+            .header("date", "Sun, 05 Jan 2014 21:31:40 GMT")
+            .body(body.to_vec())
+            .expect("valid");
+        Rfc9421Signer::new(&key, "kid")
+            .with_components(vec![Component::Method])
+            .sign(&mut req)
+            .expect("sign");
+
+        rfc9421_verify(&req, |_| Ok(public.clone()))
+            .expect("no_freshness_check preset must not enforce required components");
     }
 
     #[test]

@@ -22,13 +22,15 @@
 //! and exits).
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::config::FederationConfig;
 use crate::deliver::Deliverer;
 use crate::error::Error;
 use crate::fetch_ctx::FetchContext;
@@ -118,12 +120,49 @@ where
     fetcher: F,
     retry_policy: RetryPolicy,
     tx: mpsc::UnboundedSender<DeliveryJob>,
-    /// Budget applied to the actor-resolution fetches performed by
-    /// [`Outbox::resolve_inboxes`]. One context is shared across
-    /// all recipients of a single `dispatch` call so that a
-    /// recipient list of 2,000 actors cannot exhaust resources via
-    /// 2,000 independent recursive chains.
+    /// Shared runtime configuration. Held on the outbox so
+    /// [`Outbox::resolve_inboxes`] can apply the configured
+    /// [`UrlPolicy`](crate::UrlPolicy) to every picked inbox URL
+    /// *before* it enters the retry queue — this is the admission
+    /// gate that keeps `sharedInbox` URLs served by a malicious
+    /// actor from turning the outbox into an SSRF amplifier.
+    config: Arc<FederationConfig>,
+    /// Budget applied to each recipient's actor-resolution fetch.
+    /// A fresh [`FetchContext`] is minted *per recipient* inside
+    /// [`Outbox::resolve_inboxes`] so one dead actor burning
+    /// through its recursive budget cannot starve the siblings.
     http_fetch_limit: u32,
+    /// Global ceiling on concurrent deliveries. Every call to
+    /// `run_one` acquires one permit before touching the network,
+    /// so a fan-out to 10 000 inboxes cannot instantly pin 10 000
+    /// TCP sockets. Sized by
+    /// [`FederationConfig::delivery_concurrency`].
+    delivery_semaphore: Arc<Semaphore>,
+    /// Handle to the single background worker task spawned by
+    /// [`spawn_worker`]. Stored so that dropping the last
+    /// [`Outbox`] clone aborts the worker instead of leaking it
+    /// past the runtime's lifetime.
+    worker_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl<D, F> Drop for Inner<D, F>
+where
+    D: Deliverer,
+    F: Fetcher,
+{
+    fn drop(&mut self) {
+        // Dropping the last `Outbox` clone closes `tx` (because
+        // `Inner::tx` is gone with the `Arc`), which in turn lets
+        // the worker's `rx.recv().await` return `None` and the
+        // loop exit cleanly. We still abort explicitly as a
+        // defence-in-depth against the worker spinning on an
+        // in-flight delivery after the runtime tried to shut down.
+        if let Ok(mut slot) = self.worker_handle.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -141,26 +180,41 @@ where
 {
     /// Builds an outbox that drives `deliverer` for actual POSTs and
     /// `fetcher` for actor-to-inbox resolution, retrying transient
-    /// failures per `retry_policy`.
+    /// failures per `retry_policy` and applying `config`'s URL
+    /// policy to every picked inbox before it enters the queue.
     ///
     /// Spawns one background tokio task; consequently MUST be called
     /// from inside a tokio runtime context.
-    ///
-    /// `http_fetch_limit` is the ceiling shared between all actor
-    /// resolutions inside one [`Self::dispatch`] call — typically
-    /// sourced from
-    /// [`FederationConfig::http_fetch_limit`](crate::FederationConfig::http_fetch_limit).
     #[must_use]
-    pub fn new(deliverer: D, fetcher: F, retry_policy: RetryPolicy, http_fetch_limit: u32) -> Self {
+    pub fn new(
+        deliverer: D,
+        fetcher: F,
+        retry_policy: RetryPolicy,
+        config: Arc<FederationConfig>,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<DeliveryJob>();
+        let http_fetch_limit = config.http_fetch_limit;
+        // `Semaphore::new(0)` would deadlock every delivery; clamp
+        // the configured concurrency to at least 1 so a misconfigured
+        // build can still make (serialised) forward progress.
+        let delivery_semaphore = Arc::new(Semaphore::new(config.delivery_concurrency.max(1)));
         let inner = Arc::new(Inner {
             deliverer,
             fetcher,
             retry_policy,
             tx,
+            config,
             http_fetch_limit,
+            delivery_semaphore,
+            worker_handle: Mutex::new(None),
         });
-        spawn_worker(Arc::clone(&inner), rx);
+        let handle = spawn_worker(Arc::clone(&inner), rx);
+        // `inner` is held by both the handle struct we return and
+        // the worker task; storing the `JoinHandle` lets `Drop`
+        // abort the worker the moment the last clone goes away.
+        if let Ok(mut slot) = inner.worker_handle.lock() {
+            *slot = Some(handle);
+        }
         Self { inner }
     }
 
@@ -233,52 +287,107 @@ where
     /// Fediverse server.
     pub async fn resolve_inboxes(&self, recipient_actors: &[Url]) -> InboxResolution {
         let mut resolution = InboxResolution::default();
-        // One budget for the whole recipient list: a huge `to` / `cc`
-        // with one recipient per expensive-to-resolve host cannot
-        // linearly blow up the fetch count.
-        let ctx = FetchContext::new(self.inner.http_fetch_limit);
         for actor_url in recipient_actors {
-            match self.inner.fetcher.fetch_raw(actor_url, &ctx).await {
-                Ok(actor) => match pick_inbox(&actor, actor_url) {
-                    Ok(inbox) => {
-                        resolution.inboxes.insert(inbox);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "actpub::outbox",
-                            %actor_url, error = %e,
-                            "recipient has no usable inbox; skipping",
-                        );
-                        resolution.errors.push((actor_url.clone(), e));
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        target: "actpub::outbox",
-                        %actor_url, error = %e,
-                        "failed to fetch recipient actor; skipping",
-                    );
-                    resolution.errors.push((actor_url.clone(), e));
+            match self.resolve_one(actor_url).await {
+                Ok(inbox) => {
+                    resolution.inboxes.insert(inbox);
                 }
+                Err(e) => resolution.errors.push((actor_url.clone(), e)),
             }
         }
         resolution
     }
+
+    /// Resolves a single recipient to its admissible inbox URL, or
+    /// surfaces the reason the recipient was dropped. Extracted so
+    /// [`Self::resolve_inboxes`] stays a flat fan-out driver and the
+    /// three branching failure modes (fetch, pick, policy) stay
+    /// legible side-by-side here.
+    async fn resolve_one(&self, actor_url: &Url) -> Result<Url, Error> {
+        // Per-recipient budget: each actor gets its own copy of the
+        // recursive-fetch counter so a fan-out to 2,000 followers is
+        // not artificially clamped by a global ceiling sized for
+        // *one* inbox request's recursive chain. (The SSRF guard
+        // inside `FetchContext` still applies per call; the budget
+        // is only reset between recipients.)
+        let ctx = FetchContext::new(self.inner.http_fetch_limit);
+        let actor = self
+            .inner
+            .fetcher
+            .fetch_raw(actor_url, &ctx)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "actpub::outbox",
+                    %actor_url, error = %e,
+                    "failed to fetch recipient actor; skipping",
+                );
+                e
+            })?;
+        let inbox = pick_inbox(&actor, actor_url).map_err(|e| {
+            tracing::warn!(
+                target: "actpub::outbox",
+                %actor_url, error = %e,
+                "recipient has no usable inbox; skipping",
+            );
+            e
+        })?;
+        // Apply the URL policy (syntactic + DNS resolved) *before*
+        // the inbox enters the retry queue so a malicious actor
+        // that advertises a `sharedInbox` pointing at the loopback
+        // interface cannot cost us one queue slot + several retries
+        // per delivery.
+        self.inner
+            .config
+            .url_policy
+            .check_full(&inbox)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "actpub::outbox",
+                    %actor_url, %inbox, error = %e,
+                    "picked inbox fails URL policy; skipping",
+                );
+                e
+            })?;
+        Ok(inbox)
+    }
 }
 
-fn spawn_worker<D, F>(inner: Arc<Inner<D, F>>, mut rx: mpsc::UnboundedReceiver<DeliveryJob>)
+fn spawn_worker<D, F>(
+    inner: Arc<Inner<D, F>>,
+    mut rx: mpsc::UnboundedReceiver<DeliveryJob>,
+) -> JoinHandle<()>
 where
     D: Deliverer + 'static,
     F: Fetcher + 'static,
 {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let inner = Arc::clone(&inner);
+            // Acquire one permit *in the dispatcher* so the
+            // concurrency ceiling creates backpressure on the
+            // receive side too: when every permit is in flight the
+            // dispatcher blocks here instead of spawning yet
+            // another task. `Semaphore::close` during shutdown
+            // would surface as `AcquireError`; in that case we log
+            // once and drop the remaining queue.
+            let Ok(permit) = Arc::clone(&inner.delivery_semaphore).acquire_owned().await else {
+                tracing::error!(
+                    target: "actpub::outbox",
+                    "delivery semaphore closed; draining queued jobs",
+                );
+                break;
+            };
+            let job_inner = Arc::clone(&inner);
             tokio::spawn(async move {
-                run_one(inner, job).await;
+                // Hold the permit for the duration of
+                // `run_one`; dropping it on exit releases a slot
+                // back to the dispatcher.
+                let _permit = permit;
+                run_one(job_inner, job).await;
             });
         }
-    });
+    })
 }
 
 async fn run_one<D, F>(inner: Arc<Inner<D, F>>, job: DeliveryJob)
@@ -360,10 +469,24 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use actpub_httpsig::SigningKey;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::*;
+    use crate::policy::UrlPolicy;
+
+    /// Test config helper: a permissive [`UrlPolicy`] so the
+    /// in-process mock inbox URLs used by these tests pass the
+    /// outbox's `check_full` admission gate.
+    fn test_config() -> Arc<FederationConfig> {
+        FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://example.com/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .build()
+            .shared()
+    }
 
     /// Test deliverer that records every (inbox, attempt) call and
     /// can be configured to fail the first N attempts to drive the
@@ -488,7 +611,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
-            crate::DEFAULT_HTTP_FETCH_LIMIT,
+            test_config(),
         );
 
         let activity = json!({ "id": "https://send.example/a/1", "type": "Create" });
@@ -530,7 +653,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
-            crate::DEFAULT_HTTP_FETCH_LIMIT,
+            test_config(),
         );
 
         let report = outbox
@@ -564,7 +687,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
-            crate::DEFAULT_HTTP_FETCH_LIMIT,
+            test_config(),
         );
 
         let report = outbox
@@ -604,7 +727,7 @@ mod tests {
             ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
-            crate::DEFAULT_HTTP_FETCH_LIMIT,
+            test_config(),
         );
         let report = outbox
             .dispatch(
@@ -617,6 +740,55 @@ mod tests {
         let (ref url, ref err) = report.errors[0];
         assert_eq!(url.as_str(), alice_url);
         assert!(matches!(err, Error::ActorWithoutInbox(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_actor_whose_shared_inbox_fails_url_policy() {
+        // P0-9 regression: a malicious actor advertises a
+        // `sharedInbox` pointing at localhost. `resolve_inboxes`
+        // MUST refuse to enqueue that URL even though the actor
+        // itself parses fine -- otherwise the retry queue ends up
+        // POSTing a signed activity at the internal network.
+        let attacker_url = "https://attacker.example/users/eve";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            attacker_url.into(),
+            actor_with_shared_inbox(
+                attacker_url,
+                "https://attacker.example/users/eve/inbox",
+                "https://localhost/inbox",
+            ),
+        );
+        // Production-shape config: strict `UrlPolicy` (default),
+        // which forbids loopback hostnames in admitted URLs.
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+        let report = outbox
+            .dispatch(
+                json!({ "id": "https://sender.example/a/poison", "type": "Create" }),
+                &[attacker_url.parse().unwrap()],
+            )
+            .await;
+        assert_eq!(
+            report.enqueued, 0,
+            "loopback sharedInbox must not be enqueued"
+        );
+        assert_eq!(report.errors.len(), 1);
+        let (url, err) = &report.errors[0];
+        assert_eq!(url.as_str(), attacker_url);
+        assert!(
+            matches!(err, Error::PolicyViolation { .. }),
+            "unexpected: {err:?}",
+        );
     }
 
     #[tokio::test]
@@ -636,7 +808,7 @@ mod tests {
             ArcDeliverer(Arc::clone(&deliverer)),
             StaticFetcher { actors },
             RetryPolicy::for_tests(),
-            crate::DEFAULT_HTTP_FETCH_LIMIT,
+            test_config(),
         );
         let report = outbox
             .dispatch(
@@ -662,5 +834,116 @@ mod tests {
         async fn deliver(&self, activity: &Value, inbox: &Url) -> Result<(), Error> {
             self.0.deliver(activity, inbox).await
         }
+    }
+
+    /// Deliverer that records the instantaneous and peak number of
+    /// concurrently-in-flight deliveries, holding each one open for
+    /// ~30 ms so the outbox's concurrency ceiling is actually
+    /// exercised. Pulled out of the test body to keep the
+    /// concurrency book-keeping legible and to dodge the nested-
+    /// async-closure lint inside `#[tokio::test]` fns.
+    struct ConcurrencyObserver {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl Deliverer for ConcurrencyObserver {
+        async fn deliver(&self, _activity: &Value, _inbox: &Url) -> Result<(), Error> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            bump_peak(&self.peak, cur);
+            // Hold the permit long enough that the worker is forced
+            // to queue the rest behind the semaphore.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Monotonically lifts `peak` to `candidate` via a
+    /// compare-exchange loop. Standalone so the observer impl stays
+    /// a flat async fn.
+    fn bump_peak(peak: &AtomicUsize, candidate: usize) {
+        let mut current = peak.load(Ordering::SeqCst);
+        while candidate > current {
+            match peak.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(got) => current = got,
+            }
+        }
+    }
+
+    /// Adapter mirroring [`ArcDeliverer`] but for the concurrency
+    /// observer; needed because [`Outbox::new`] takes its deliverer
+    /// by value and the test needs to inspect the observer after
+    /// dispatching.
+    struct ArcObserver(Arc<ConcurrencyObserver>);
+
+    impl Deliverer for ArcObserver {
+        async fn deliver(&self, a: &Value, i: &Url) -> Result<(), Error> {
+            self.0.deliver(a, i).await
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_caps_concurrent_deliveries_via_semaphore() {
+        // P0-6 regression: a fan-out to many recipients must be
+        // clamped by `delivery_concurrency`, not by whatever the
+        // runtime happens to tolerate. We set the ceiling to 2, ask
+        // the deliverer to record the concurrency peak it observes,
+        // then dispatch to 8 recipients -- the peak MUST NOT exceed
+        // the configured 2.
+        use tokio::time::sleep;
+
+        let mut actors = std::collections::HashMap::new();
+        for n in 0..8 {
+            let url = format!("https://example.com/users/a{n}");
+            actors.insert(
+                url.clone(),
+                actor_with_inbox(&url, &format!("https://example.com/inbox/{n}")),
+            );
+        }
+        let observer = Arc::new(ConcurrencyObserver {
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .delivery_concurrency(2)
+            .build()
+            .shared();
+        let outbox = Outbox::new(
+            ArcObserver(Arc::clone(&observer)),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+
+        let recipients: Vec<Url> = (0..8)
+            .map(|n| format!("https://example.com/users/a{n}").parse().unwrap())
+            .collect();
+        let report = outbox
+            .dispatch(
+                json!({ "id": "https://sender.example/a/fanout", "type": "Create" }),
+                &recipients,
+            )
+            .await;
+        assert_eq!(report.enqueued, 8);
+
+        // Wait until all 8 deliveries have completed. 8 * 30 ms
+        // with a concurrency of 2 takes roughly 120 ms; sleep
+        // generously.
+        sleep(Duration::from_millis(600)).await;
+        let peak = observer.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "observed concurrent deliveries {peak} exceeds the configured cap of 2",
+        );
+        assert!(
+            peak >= 2,
+            "expected the cap to actually be exercised; observed peak {peak}",
+        );
     }
 }

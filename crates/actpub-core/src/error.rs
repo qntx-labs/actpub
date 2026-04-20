@@ -4,6 +4,7 @@
 //! `#[non_exhaustive]` so that adding a new failure mode is not a
 //! breaking change.
 
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 /// Top-level error type for `actpub-core`.
@@ -57,6 +58,57 @@ pub enum Error {
     /// public key.
     #[error("multikey decoding failed: {0}")]
     InvalidMultikey(String),
+
+    /// The proof's `verificationMethod` URL did not match the key
+    /// the caller asked us to verify against. Carrying both URLs in
+    /// the error is important for the FEP-8b32 threat model: a
+    /// silent acceptance here is the `key confusion` attack where a
+    /// captured signature is re-bound to a different identity.
+    #[error("proof.verificationMethod `{found}` does not match expected `{expected}`")]
+    VerificationMethodMismatch {
+        /// The URL the caller expected.
+        expected: String,
+        /// The URL the proof claimed.
+        found: String,
+    },
+
+    /// The proof's `proofPurpose` did not match the context the
+    /// caller declared (typically `assertionMethod` for content
+    /// assertions vs. `authentication` for challenge–response login).
+    /// Without this gate, a signature issued for one purpose can be
+    /// laundered as if it had been issued for another.
+    #[error("proof.proofPurpose `{found}` does not match expected `{expected}`")]
+    ProofPurposeMismatch {
+        /// The purpose the caller expected.
+        expected: String,
+        /// The purpose the proof declared.
+        found: String,
+    },
+
+    /// The proof's `created` timestamp is older than the caller's
+    /// `max_age` window. Data Integrity proofs without an
+    /// expiration grow stale indefinitely unless the verifier
+    /// caps their lifetime explicitly.
+    #[error("proof.created `{created}` is older than the verifier's window (`now = {now}`)")]
+    ProofTimestampTooOld {
+        /// Parsed `created` instant.
+        created: DateTime<Utc>,
+        /// The `now` the verifier was called with.
+        now: DateTime<Utc>,
+    },
+
+    /// The proof's `created` timestamp sits more than the allowed
+    /// clock-skew window into the future — almost certainly a
+    /// forgery or a signer with a badly-set clock.
+    #[error(
+        "proof.created `{created}` is further in the future than the verifier's skew window (`now = {now}`)"
+    )]
+    ProofTimestampInFuture {
+        /// Parsed `created` instant.
+        created: DateTime<Utc>,
+        /// The `now` the verifier was called with.
+        now: DateTime<Utc>,
+    },
 
     /// A low-level cryptographic error from the underlying HTTP-Sig
     /// crate.

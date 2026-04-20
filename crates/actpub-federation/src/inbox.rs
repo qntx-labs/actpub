@@ -59,10 +59,11 @@ use std::sync::Arc;
 
 use actpub_httpsig::{
     CavageHeaderParams, Multikey as HsMultikey, SIGNATURE_HEADER, VerifyingKey,
-    parse_signature_input_dict, sha256_digest_header, verify as verify_signature,
-    verify_any_content_digest_header,
+    parse_signature_input_dict, verify_any_content_digest_header, verify_digest_header,
+    verify_with_policy,
 };
 use bytes::Bytes;
+use chrono::Utc;
 use http::Method;
 use moka::future::Cache;
 use serde_json::Value;
@@ -158,7 +159,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboxPipeline")
-            .field("dedup_capacity", &self.inner.config.cache_capacity)
+            .field("dedup_capacity", &self.inner.config.dedup_capacity)
             .finish()
     }
 }
@@ -226,7 +227,18 @@ where
         let verifying_key = pick_verifying_key(&signing_actor, &key_id)?;
 
         let req = rebuild_request(parts, body.clone());
-        verify_signature(&req, |_| Ok(verifying_key.clone())).map_err(Error::from)?;
+        // Replay-protection gate: the `VerifyPolicy` in
+        // `FederationConfig` (Mastodon-equivalent by default) enforces
+        // the Fediverse-canonical 12 h past / 5 min future skew
+        // window plus the RFC 9421 minimum covered-component set, so
+        // a captured-and-replayed signature cannot survive past the
+        // verifier. `Utc::now()` is intentionally read once *here*
+        // (not at pipeline construction) so the check reflects the
+        // moment the signature is evaluated.
+        verify_with_policy(&req, &self.inner.config.verify_policy, Utc::now(), |_| {
+            Ok(verifying_key.clone())
+        })
+        .map_err(Error::from)?;
 
         let activity: Value = serde_json::from_slice(&body)?;
         let activity_id = activity
@@ -353,14 +365,13 @@ fn verify_body_integrity(parts: &http::request::Parts, body: &[u8]) -> Result<()
             Ok(())
         }
         (None, Some(d)) => {
-            // Compare against our own SHA-256 digest of the body. The
-            // legacy header has the shape `SHA-256=<base64>`.
-            let expected = sha256_digest_header(body);
-            if d.eq_ignore_ascii_case(&expected) {
-                Ok(())
-            } else {
-                Err(Error::HttpSig(actpub_httpsig::Error::DigestMismatch))
-            }
+            // Delegate to the crate-native verifier so the base64
+            // payload is compared in **constant time** against the
+            // expected digest bytes. The previous hand-rolled
+            // `eq_ignore_ascii_case` compared the full `SHA-256=<…>`
+            // ASCII string, which (a) was not constant-time and (b)
+            // incorrectly case-folded the base64 payload.
+            verify_digest_header(&d, body).map_err(Error::from)
         }
         (None, None) => Err(Error::HttpSig(actpub_httpsig::Error::RequiredHeaderAbsent(
             "digest".to_owned(),
@@ -421,6 +432,8 @@ fn strip_fragment(key_id: &str) -> Result<Url, Error> {
 }
 
 fn pick_verifying_key(actor: &Value, key_id: &str) -> Result<VerifyingKey, Error> {
+    let actor_id = actor.get("id").and_then(Value::as_str).unwrap_or("");
+
     // 1. FEP-521a Multikey (modern Ed25519): match by `id`.
     if let Some(methods) = actor.get("assertionMethod").and_then(Value::as_array) {
         for entry in methods {
@@ -430,6 +443,19 @@ fn pick_verifying_key(actor: &Value, key_id: &str) -> Result<VerifyingKey, Error
             let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
             if id != key_id {
                 continue;
+            }
+            // FEP-521a / W3C VC-DI: the `controller` of a
+            // verificationMethod MUST be the actor URL the key is
+            // bound to. Without this check an attacker actor `A`
+            // could embed an `assertionMethod` pointing at any
+            // arbitrary public key and have this pipeline accept
+            // signatures made by the key's holder as if they came
+            // from `A`.
+            let controller = obj.get("controller").and_then(Value::as_str).unwrap_or("");
+            if controller != actor_id {
+                return Err(Error::SignerKeyMismatch(format!(
+                    "assertionMethod.controller `{controller}` must equal actor.id `{actor_id}`",
+                )));
             }
             let multibase = obj
                 .get("publicKeyMultibase")
@@ -453,6 +479,17 @@ fn pick_verifying_key(actor: &Value, key_id: &str) -> Result<VerifyingKey, Error
         if pk_id != key_id {
             return Err(Error::SignerKeyMismatch(format!(
                 "actor.publicKey.id `{pk_id}` does not equal signing keyId `{key_id}`",
+            )));
+        }
+        // Legacy Mastodon profile: the `publicKey.owner` field MUST
+        // equal the actor's own `id`. Skipping this check lets an
+        // attacker actor `A` link a public key block whose `owner`
+        // is some *other* identity `B`; signatures made by `B`'s
+        // holder would then be accepted as if they came from `A`.
+        let pk_owner = pk.get("owner").and_then(Value::as_str).unwrap_or("");
+        if pk_owner != actor_id {
+            return Err(Error::SignerKeyMismatch(format!(
+                "actor.publicKey.owner `{pk_owner}` must equal actor.id `{actor_id}`",
             )));
         }
         if let Some(pem) = pk.get("publicKeyPem").and_then(Value::as_str) {
@@ -771,6 +808,128 @@ mod tests {
             .expect_err("cross-domain impersonation must be rejected");
         assert!(
             matches!(err, Error::SignerKeyMismatch(_)),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_legacy_public_key_whose_owner_differs_from_actor_id() {
+        // P0-12 regression: an attacker actor `A` returns a
+        // `publicKey` block that correctly binds `publicKey.id` to
+        // the signing `keyId`, but sets `publicKey.owner` to some
+        // *other* identity `B`. The signature verifies
+        // mathematically, yet the pipeline MUST refuse to hand the
+        // activity to the handler -- the key is not actually `A`'s.
+        let activity = json!({ "id": "https://send.example.com/acts/1", "type": "Create" });
+        let (parts, body, _public) = signed_inbox_request(&activity);
+        let other_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAXAm6N+kyXkCSdMVqkCD8GLYRXlkxAaJIpA8Yk0g3x4c=\n-----END PUBLIC KEY-----";
+        let actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "publicKey": {
+                "id": "https://send.example.com/users/alice#key",
+                "owner": "https://send.example.com/users/bob",
+                "publicKeyPem": other_pem,
+            },
+        });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("owner/actor mismatch must be rejected");
+        assert!(
+            matches!(err, Error::SignerKeyMismatch(ref msg) if msg.contains("owner")),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_multikey_whose_controller_differs_from_actor_id() {
+        // P0-12 regression (FEP-521a arm): an attacker actor embeds
+        // an `assertionMethod` whose `controller` points at a
+        // different identity. The key it names may be anyone's; the
+        // pipeline MUST not infer that signatures by that key speak
+        // for the fetched actor.
+        let activity = json!({ "id": "https://send.example.com/acts/1", "type": "Create" });
+        let (parts, body, public) = signed_inbox_request(&activity);
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "assertionMethod": [{
+                "id": "https://send.example.com/users/alice#key",
+                "type": "Multikey",
+                "controller": "https://send.example.com/users/bob",
+                "publicKeyMultibase": multibase,
+            }],
+        });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("controller/actor mismatch must be rejected");
+        assert!(
+            matches!(err, Error::SignerKeyMismatch(ref msg) if msg.contains("controller")),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_12h_old_cavage_signature_by_default() {
+        // P0-1 regression: the default `VerifyPolicy::mastodon()`
+        // enforces a 12 h past-side replay window. A captured signed
+        // POST whose `Date` header is 13 h ago MUST be rejected by
+        // the pipeline *before* the handler is called, even though
+        // the cryptographic signature itself is still mathematically
+        // valid.
+        use std::time::SystemTime;
+
+        let activity = json!({ "id": "https://send.example.com/acts/stale", "type": "Create" });
+        let body = serde_json::to_vec(&activity).unwrap();
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let stale_date = SystemTime::now()
+            .checked_sub(std::time::Duration::from_hours(13))
+            .expect("subtract 13h from now");
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://recv.example.com/users/bob/inbox")
+            .header("host", "recv.example.com")
+            .header("date", httpdate::fmt_http_date(stale_date))
+            .header("content-type", crate::AP_CONTENT_TYPE)
+            .header("digest", sha256_digest_header(&body))
+            .header(
+                "content-digest",
+                content_digest_header_with(&body, &[actpub_httpsig::DigestAlgorithm::Sha256]),
+            )
+            .body(body.clone())
+            .unwrap();
+        CavageSigner::new(&key, "https://send.example.com/users/alice#key")
+            .sign(&mut req)
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let actor =
+            actor_json_with_pem("https://send.example.com/users/alice#key", &multibase, true);
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, Bytes::from(body))
+            .await
+            .expect_err("stale signature must be rejected by the default policy");
+        assert!(
+            matches!(
+                err,
+                Error::HttpSig(actpub_httpsig::Error::TimestampTooOld { .. })
+            ),
             "unexpected: {err:?}",
         );
     }

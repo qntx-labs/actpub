@@ -112,7 +112,15 @@ impl ReqwestDeliverer {
 
 impl Deliverer for ReqwestDeliverer {
     async fn deliver(&self, activity: &Value, inbox: &Url) -> Result<(), Error> {
-        self.inner.config.url_policy.check(inbox)?;
+        // Full admission check — syntactic, *and* DNS-resolved IP.
+        // The synchronous `UrlPolicy::check` is not enough for the
+        // deliver path: without re-checking the resolved address,
+        // `evil.example` with an `A` record pointing at `127.0.0.1`
+        // (DNS rebinding) would pass policy and then get connected
+        // straight to the internal network, turning this server
+        // into an outbound SSRF proxy for any remote actor that
+        // advertises such an inbox URL.
+        self.inner.config.url_policy.check_full(inbox).await?;
 
         let body = serde_json::to_vec(activity)?;
         // Both digests: the legacy `Digest:` header (Mastodon's
@@ -142,7 +150,7 @@ impl Deliverer for ReqwestDeliverer {
                 reason: format!("could not build delivery request: {e}"),
             })?;
         CavageSigner::new(
-            &self.inner.config.signing_key,
+            self.inner.config.signing_key_ref(),
             self.inner.config.key_id.as_str(),
         )
         .sign(&mut signing_req)?;
@@ -298,6 +306,41 @@ mod tests {
 
         let deliverer = ReqwestDeliverer::new(test_config(&server.uri())).unwrap();
         deliverer.deliver(&sample_activity(), &inbox).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deliver_rejects_inbox_whose_host_resolves_to_loopback_via_default_policy() {
+        // P0-2 regression: `deliver` MUST run the *full* URL policy —
+        // the one that also resolves DNS and inspects the resulting
+        // IP address — before any network IO. The legacy synchronous
+        // `check` alone lets an attacker bypass SSRF protection by
+        // pointing `evil.example` at `127.0.0.1` (DNS rebinding) in
+        // the actor JSON's `inbox`.
+        //
+        // Constructing a genuine DNS-rebinding scenario requires
+        // controlling a resolver, which is impractical in a unit
+        // test. We instead exercise the `check_full` gate through
+        // its short-circuit shape: a bare-loopback host (`localhost`)
+        // is rejected whether we go through `check` or `check_full`,
+        // but this test lives in the deliver path specifically, so
+        // it pins the admission gate there.
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://example.com/users/alice#key".parse().unwrap())
+            .build()
+            .shared();
+        let deliverer = ReqwestDeliverer::new(cfg).unwrap();
+        let err = deliverer
+            .deliver(
+                &sample_activity(),
+                &"https://localhost/inbox".parse().unwrap(),
+            )
+            .await
+            .expect_err("loopback-host inbox must fail the URL policy");
+        assert!(
+            matches!(err, Error::PolicyViolation { .. }),
+            "unexpected: {err:?}",
+        );
     }
 
     #[tokio::test]

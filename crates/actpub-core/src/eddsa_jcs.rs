@@ -31,7 +31,7 @@
 
 use actpub_httpsig::{Ed25519PublicKey, Ed25519SigningKey};
 use aws_lc_rs::digest::{self, SHA256};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use multibase::Base;
 use serde_json::Value;
 use url::Url;
@@ -138,24 +138,114 @@ pub fn sign(
     Ok(signed)
 }
 
-/// Verifies that `signed_document.proof` is an authentic
-/// `eddsa-jcs-2022` Data Integrity proof produced by the holder of
-/// `verifying_key`.
+/// Default maximum age of a Data Integrity proof accepted by
+/// [`VerifyOptions`]: 24 hours. Mirrors the Mastodon 4.5 / Mitra
+/// convention that a Fediverse proof older than one day is stale.
+pub const DEFAULT_PROOF_MAX_AGE: Duration = Duration::hours(24);
+
+/// Default clock-skew tolerance on the future side: 5 minutes. Matches
+/// Mastodon's HTTP-Signature policy.
+pub const DEFAULT_PROOF_MAX_CLOCK_SKEW_FUTURE: Duration = Duration::minutes(5);
+
+/// Caller-supplied constraints that [`verify`] applies to every
+/// Data Integrity proof.
+///
+/// Every field is mandatory because every field participates in the
+/// FEP-8b32 threat model: omitting `expected_verification_method`
+/// admits key-confusion attacks, omitting `expected_proof_purpose`
+/// admits purpose-laundering, and omitting the timestamp window
+/// leaves a captured proof valid forever.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct VerifyOptions<'a> {
+    /// The full URL the caller has decided the signing key is
+    /// identified by (typically `<actor URL>#<key fragment>`).
+    /// [`verify`] rejects any proof whose
+    /// `verificationMethod` string is not byte-for-byte equal to
+    /// this URL — ensuring the caller has itself fetched the actor
+    /// and cross-checked that the named key actually belongs there.
+    pub expected_verification_method: &'a Url,
+    /// The purpose the caller is willing to accept. Pass
+    /// [`PROOF_PURPOSE_ASSERTION`] for content assertions (the
+    /// overwhelmingly common case); pass `"authentication"` when
+    /// consuming a challenge–response proof.
+    pub expected_proof_purpose: &'a str,
+    /// Instant the verifier is treating as "now". Injected instead
+    /// of read from the clock so integration tests can pin
+    /// determinism.
+    pub now: DateTime<Utc>,
+    /// Reject proofs whose `created` is more than `max_age` older
+    /// than `now`. `None` disables the past-side check — use only
+    /// for static conformance fixtures.
+    pub max_age: Option<Duration>,
+    /// Reject proofs whose `created` is more than
+    /// `max_clock_skew_future` ahead of `now`. `None` disables the
+    /// future-side check.
+    pub max_clock_skew_future: Option<Duration>,
+}
+
+impl<'a> VerifyOptions<'a> {
+    /// Options for the overwhelmingly common case: an
+    /// `assertionMethod` proof, with the Mastodon-equivalent 24 h
+    /// past / 5 min future window.
+    #[must_use]
+    pub const fn assertion(expected_verification_method: &'a Url, now: DateTime<Utc>) -> Self {
+        Self {
+            expected_verification_method,
+            expected_proof_purpose: PROOF_PURPOSE_ASSERTION,
+            now,
+            max_age: Some(DEFAULT_PROOF_MAX_AGE),
+            max_clock_skew_future: Some(DEFAULT_PROOF_MAX_CLOCK_SKEW_FUTURE),
+        }
+    }
+}
+
+/// Full FEP-8b32 verification for `signed_document.proof`.
+///
+/// Proves that the proof is an authentic `eddsa-jcs-2022` Data
+/// Integrity signature produced by the holder of `verifying_key`,
+/// **and** that every FEP-8b32 mandatory field binds the proof to
+/// the exact caller context described by `options`.
+///
+/// Specifically, this function rejects:
+///
+/// - documents whose `proof.type` is not `DataIntegrityProof`;
+/// - proofs whose `cryptosuite` is not `eddsa-jcs-2022`;
+/// - proofs whose `verificationMethod` does not match
+///   [`VerifyOptions::expected_verification_method`] (key confusion);
+/// - proofs whose `proofPurpose` does not match
+///   [`VerifyOptions::expected_proof_purpose`] (purpose laundering);
+/// - proofs whose `created` timestamp is missing, malformed, older
+///   than `max_age`, or more than `max_clock_skew_future` in the
+///   future;
+/// - proofs whose cryptographic signature does not validate against
+///   `verifying_key` over the canonical hash data.
 ///
 /// # Errors
 ///
-/// Returns [`Error::MissingProof`] when no `proof` member is present,
-/// [`Error::UnsupportedProofType`] / [`Error::UnsupportedCryptosuite`]
-/// when the proof header does not match this cryptosuite,
-/// [`Error::InvalidProofValue`] when `proofValue` cannot be decoded
-/// into a 64-byte Ed25519 signature, [`Error::Canonicalisation`] for
-/// JCS failures, and [`Error::SignatureMismatch`] when the signature
-/// does not validate against the document and key.
-pub fn verify(signed_document: &Value, verifying_key: &Ed25519PublicKey) -> Result<(), Error> {
+/// Returns [`Error::MissingProof`], [`Error::UnsupportedProofType`],
+/// [`Error::UnsupportedCryptosuite`], [`Error::InvalidProofValue`],
+/// [`Error::InvalidProofField`], [`Error::VerificationMethodMismatch`],
+/// [`Error::ProofPurposeMismatch`], [`Error::ProofTimestampTooOld`],
+/// [`Error::ProofTimestampInFuture`], [`Error::Canonicalisation`], or
+/// [`Error::SignatureMismatch`].
+pub fn verify(
+    signed_document: &Value,
+    verifying_key: &Ed25519PublicKey,
+    options: &VerifyOptions<'_>,
+) -> Result<(), Error> {
     let proof = signed_document.get("proof").ok_or(Error::MissingProof)?;
     let raw_signature = decode_proof_value(proof)?;
 
     check_proof_header(proof)?;
+    check_verification_method(proof, options.expected_verification_method)?;
+    check_proof_purpose(proof, options.expected_proof_purpose)?;
+    check_created_timestamp(
+        proof,
+        options.now,
+        options.max_age,
+        options.max_clock_skew_future,
+    )?;
 
     let proof_config = strip_proof_value(proof.clone());
     let transformed = strip_proof(signed_document.clone());
@@ -171,7 +261,8 @@ pub fn verify(signed_document: &Value, verifying_key: &Ed25519PublicKey) -> Resu
 ///
 /// This is the convenient form for inbox handlers that have already
 /// fetched the signing actor and want to verify against one of the
-/// actor's `assertionMethod` keys.
+/// actor's `assertionMethod` keys. All [`VerifyOptions`] constraints
+/// are enforced exactly as by [`verify`].
 ///
 /// # Errors
 ///
@@ -180,10 +271,82 @@ pub fn verify(signed_document: &Value, verifying_key: &Ed25519PublicKey) -> Resu
 pub fn verify_with_multikey(
     signed_document: &Value,
     multikey: &actpub_activitystreams::Multikey,
+    options: &VerifyOptions<'_>,
 ) -> Result<(), Error> {
     let decoded = actpub_httpsig::Multikey::decode(&multikey.public_key_multibase)
         .map_err(|e| Error::InvalidMultikey(e.to_string()))?;
-    verify(signed_document, &decoded.key)
+    verify(signed_document, &decoded.key, options)
+}
+
+fn check_verification_method(proof: &Value, expected: &Url) -> Result<(), Error> {
+    let found = proof
+        .get("verificationMethod")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidProofField {
+            field: "verificationMethod",
+            reason: "missing or non-string".to_owned(),
+        })?;
+    if found != expected.as_str() {
+        return Err(Error::VerificationMethodMismatch {
+            expected: expected.to_string(),
+            found: found.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn check_proof_purpose(proof: &Value, expected: &str) -> Result<(), Error> {
+    let found = proof
+        .get("proofPurpose")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidProofField {
+            field: "proofPurpose",
+            reason: "missing or non-string".to_owned(),
+        })?;
+    if found != expected {
+        return Err(Error::ProofPurposeMismatch {
+            expected: expected.to_owned(),
+            found: found.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn check_created_timestamp(
+    proof: &Value,
+    now: DateTime<Utc>,
+    max_age: Option<Duration>,
+    max_skew_future: Option<Duration>,
+) -> Result<(), Error> {
+    let raw = proof
+        .get("created")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidProofField {
+            field: "created",
+            reason: "missing or non-string".to_owned(),
+        })?;
+    // FEP-8b32 defers to XSD `dateTime`, but the cryptosuite
+    // explicitly writes ISO-8601 / RFC 3339 seconds-precision in the
+    // serialiser. Accepting both here so older peers that emit
+    // fractional seconds still verify.
+    let created = DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| Error::InvalidProofField {
+            field: "created",
+            reason: format!("not a valid RFC 3339 timestamp: {e}"),
+        })?
+        .with_timezone(&Utc);
+
+    if let Some(skew) = max_skew_future
+        && created > now + skew
+    {
+        return Err(Error::ProofTimestampInFuture { created, now });
+    }
+    if let Some(max_age) = max_age
+        && now.signed_duration_since(created) > max_age
+    {
+        return Err(Error::ProofTimestampTooOld { created, now });
+    }
+    Ok(())
 }
 
 fn build_proof_config(unsigned_document: &Value, options: &ProofOptions) -> Value {
@@ -294,13 +457,30 @@ mod tests {
 
     fn fixed_options() -> ProofOptions {
         ProofOptions {
-            verification_method: "https://example.com/users/alice#ed25519-key"
-                .parse()
-                .unwrap(),
+            verification_method: fixed_vm(),
             proof_purpose: PROOF_PURPOSE_ASSERTION.to_owned(),
             created: Utc.with_ymd_and_hms(2026, 4, 20, 10, 0, 0).unwrap(),
             challenge: None,
             domain: None,
+        }
+    }
+
+    fn fixed_vm() -> Url {
+        "https://example.com/users/alice#ed25519-key"
+            .parse()
+            .unwrap()
+    }
+
+    /// Static verification options tied to [`fixed_options`]'s
+    /// fixed instant — freshness checks disabled so the suite is
+    /// time-invariant.
+    fn test_opts(vm: &Url) -> VerifyOptions<'_> {
+        VerifyOptions {
+            expected_verification_method: vm,
+            expected_proof_purpose: PROOF_PURPOSE_ASSERTION,
+            now: Utc.with_ymd_and_hms(2026, 4, 20, 10, 0, 0).unwrap(),
+            max_age: None,
+            max_clock_skew_future: None,
         }
     }
 
@@ -326,7 +506,8 @@ mod tests {
     fn sign_then_verify_roundtrips() {
         let key = Ed25519SigningKey::generate().unwrap();
         let signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
-        verify(&signed, &key.public_key()).expect("self-verify must succeed");
+        let vm = fixed_vm();
+        verify(&signed, &key.public_key(), &test_opts(&vm)).expect("self-verify must succeed");
     }
 
     #[test]
@@ -365,7 +546,15 @@ mod tests {
         let proof = &signed["proof"];
         assert_eq!(proof["challenge"], json!("nonce-abc"));
         assert_eq!(proof["domain"], json!("example.org"));
-        verify(&signed, &key.public_key()).expect("auth proof must verify");
+        // This test signs with `proofPurpose = authentication`; the
+        // verifier now enforces purpose binding, so we must declare
+        // the expected purpose explicitly.
+        let vm = fixed_vm();
+        let verify_opts = VerifyOptions {
+            expected_proof_purpose: "authentication",
+            ..test_opts(&vm)
+        };
+        verify(&signed, &key.public_key(), &verify_opts).expect("auth proof must verify");
     }
 
     #[test]
@@ -375,7 +564,8 @@ mod tests {
         // Mutate a nested field after signing.
         signed["object"]["content"] = json!("<p>tampered</p>");
 
-        let err = verify(&signed, &key.public_key())
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
             .expect_err("tampering with the body must invalidate the proof");
         assert!(matches!(err, Error::SignatureMismatch));
     }
@@ -387,7 +577,8 @@ mod tests {
         // Move the `created` timestamp by one second after signing.
         signed["proof"]["created"] = json!("2026-04-20T10:00:01Z");
 
-        let err = verify(&signed, &key.public_key())
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
             .expect_err("tampering with proof metadata must invalidate the proof");
         assert!(matches!(err, Error::SignatureMismatch));
     }
@@ -401,8 +592,9 @@ mod tests {
         let bogus_sig = key.sign(b"not the original hash data");
         signed["proof"]["proofValue"] = json!(multibase::encode(Base::Base58Btc, bogus_sig));
 
-        let err =
-            verify(&signed, &key.public_key()).expect_err("a swapped signature must not verify");
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("a swapped signature must not verify");
         assert!(matches!(err, Error::SignatureMismatch));
     }
 
@@ -412,16 +604,19 @@ mod tests {
         let attacker = Ed25519SigningKey::generate().unwrap();
 
         let signed = sign(&sample_create(), &fixed_options(), &signer).unwrap();
-        let err = verify(&signed, &attacker.public_key())
+        let vm = fixed_vm();
+        let err = verify(&signed, &attacker.public_key(), &test_opts(&vm))
             .expect_err("verifying against the wrong public key must fail");
         assert!(matches!(err, Error::SignatureMismatch));
     }
 
     #[test]
     fn verify_rejects_missing_proof() {
+        let vm = fixed_vm();
         let err = verify(
             &sample_create(),
             &Ed25519SigningKey::generate().unwrap().public_key(),
+            &test_opts(&vm),
         )
         .expect_err("documents without proof must be rejected");
         assert!(matches!(err, Error::MissingProof));
@@ -433,7 +628,9 @@ mod tests {
         let mut signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
         signed["proof"]["type"] = json!("RsaSignature2017");
 
-        let err = verify(&signed, &key.public_key()).expect_err("wrong type must fail");
+        let vm = fixed_vm();
+        let err =
+            verify(&signed, &key.public_key(), &test_opts(&vm)).expect_err("wrong type must fail");
         assert!(matches!(err, Error::UnsupportedProofType(s) if s == "RsaSignature2017"));
     }
 
@@ -443,7 +640,9 @@ mod tests {
         let mut signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
         signed["proof"]["cryptosuite"] = json!("ecdsa-rdfc-2019");
 
-        let err = verify(&signed, &key.public_key()).expect_err("wrong cryptosuite must fail");
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("wrong cryptosuite must fail");
         assert!(matches!(err, Error::UnsupportedCryptosuite(s) if s == "ecdsa-rdfc-2019"));
     }
 
@@ -453,7 +652,9 @@ mod tests {
         let mut signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
         signed["proof"]["proofValue"] = json!("zNotARealMultibaseString!!");
 
-        let err = verify(&signed, &key.public_key()).expect_err("garbage proofValue must fail");
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("garbage proofValue must fail");
         assert!(matches!(err, Error::InvalidProofValue(_)));
     }
 
@@ -466,7 +667,9 @@ mod tests {
         let short = multibase::encode(Base::Base58Btc, [0u8; 32]);
         signed["proof"]["proofValue"] = json!(short);
 
-        let err = verify(&signed, &key.public_key()).expect_err("wrong length must fail");
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("wrong length must fail");
         assert!(matches!(err, Error::InvalidProofValue(_)));
     }
 
@@ -527,7 +730,88 @@ mod tests {
             encoded,
         );
 
-        verify_with_multikey(&signed, &multikey)
+        let vm = fixed_vm();
+        verify_with_multikey(&signed, &multikey, &test_opts(&vm))
             .expect("verifying via FEP-521a multikey block must succeed");
+    }
+
+    #[test]
+    fn verify_rejects_proof_whose_verification_method_differs_from_expected() {
+        // P0-3 regression: the proof claims to be signed by key A,
+        // and the caller asks us to verify against key B. Even
+        // though the signature math itself succeeds, the verifier
+        // MUST refuse the binding so a captured signature cannot be
+        // laundered under a different identity.
+        let key = Ed25519SigningKey::generate().unwrap();
+        let signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
+        let wrong_vm: Url = "https://example.com/users/alice#other-key".parse().unwrap();
+        let err = verify(&signed, &key.public_key(), &test_opts(&wrong_vm))
+            .expect_err("verificationMethod mismatch must be rejected");
+        assert!(matches!(err, Error::VerificationMethodMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_rejects_authentication_proof_when_assertion_is_expected() {
+        // P0-3 regression: a proof signed with
+        // `proofPurpose = authentication` (e.g. for a challenge-
+        // response login flow) MUST NOT verify when the caller is
+        // asking for a content assertion. Otherwise an
+        // authentication proof obtained during a single login can
+        // be re-used forever as evidence that the actor "asserts"
+        // some captured document.
+        let key = Ed25519SigningKey::generate().unwrap();
+        let mut opts = fixed_options();
+        opts.proof_purpose = "authentication".to_owned();
+        let signed = sign(&sample_create(), &opts, &key).unwrap();
+        let vm = fixed_vm();
+        let err = verify(&signed, &key.public_key(), &test_opts(&vm))
+            .expect_err("authentication proof must not verify as assertion");
+        assert!(
+            matches!(
+                err,
+                Error::ProofPurposeMismatch { ref expected, ref found }
+                    if expected == PROOF_PURPOSE_ASSERTION && found == "authentication",
+            ),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[test]
+    fn verify_rejects_proof_with_stale_created_timestamp() {
+        // P0-3 regression: without a `max_age` cap, a 10-year-old
+        // signed document would verify indefinitely. The verifier
+        // MUST reject any proof whose `created` is older than the
+        // caller's window.
+        let key = Ed25519SigningKey::generate().unwrap();
+        let signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
+        let vm = fixed_vm();
+        let opts = VerifyOptions {
+            now: Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap(), // +48 h
+            max_age: Some(Duration::hours(24)),
+            max_clock_skew_future: Some(Duration::minutes(5)),
+            ..test_opts(&vm)
+        };
+        let err =
+            verify(&signed, &key.public_key(), &opts).expect_err("48 h > 24 h max_age must reject");
+        assert!(matches!(err, Error::ProofTimestampTooOld { .. }));
+    }
+
+    #[test]
+    fn verify_rejects_proof_whose_created_is_in_the_future() {
+        // Clock-skew defence: if the signer claims `created` is
+        // 10 minutes ahead of the verifier's clock while the
+        // allowed skew is 5 minutes, the proof is rejected.
+        let key = Ed25519SigningKey::generate().unwrap();
+        let signed = sign(&sample_create(), &fixed_options(), &key).unwrap();
+        let vm = fixed_vm();
+        let opts = VerifyOptions {
+            now: Utc.with_ymd_and_hms(2026, 4, 20, 9, 50, 0).unwrap(), // 10 min before `created`
+            max_age: None,
+            max_clock_skew_future: Some(Duration::minutes(5)),
+            ..test_opts(&vm)
+        };
+        let err = verify(&signed, &key.public_key(), &opts)
+            .expect_err("future-dated created must be rejected");
+        assert!(matches!(err, Error::ProofTimestampInFuture { .. }));
     }
 }

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use actpub_httpsig::SigningKey;
+use actpub_httpsig::{SigningKey, VerifyPolicy};
 use bon::Builder;
 use url::Url;
 
@@ -31,8 +31,40 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// bound memory under adversarial load.
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 20;
 
-/// Default in-memory cache size (1024 entries).
+/// Default actor-fetch cache size (1024 entries).
+///
+/// Sized for the working-set of one Fediverse instance's
+/// `assertionMethod` and profile fetches; the inbox-dedup cache is
+/// sized separately by [`DEFAULT_DEDUP_CAPACITY`] because it serves
+/// a different purpose and needs a much larger window.
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1024;
+
+/// Default actor-fetch cache TTL (10 minutes) — short enough that a
+/// key rotation reaches verifiers quickly, long enough that a hot
+/// inbox does not re-fetch the same actor on every delivery.
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(10);
+
+/// Default inbox-dedup cache size (100 000 entries).
+///
+/// The dedup cache is a **replay-protection** structure, not a
+/// fetch cache: each entry is one inbox POST the pipeline has
+/// already accepted, kept so a verbatim resend is dropped as a
+/// duplicate. Sized for a Mastodon-class instance receiving
+/// O(100) posts/sec — a 10-minute rolling window of activity fits
+/// in ~60 000 entries, so 100 000 leaves comfortable headroom
+/// before the LRU starts evicting entries the 12 h freshness
+/// window still considers replayable.
+pub const DEFAULT_DEDUP_CAPACITY: u64 = 100_000;
+
+/// Default inbox-dedup cache TTL (1 hour).
+///
+/// Must be **at least** as large as the
+/// [`VerifyPolicy`](actpub_httpsig::VerifyPolicy) `max_age`
+/// window: a dedup entry older than `max_age` is irrelevant
+/// because the signature-freshness gate would reject the
+/// replayed request anyway. One hour is a conservative middle
+/// ground between CPU cost and memory pressure.
+pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_hours(1);
 
 /// Default cap on the number of recursive HTTP fetches a single
 /// inbox request or activity resolution is allowed to trigger.
@@ -43,10 +75,14 @@ pub const DEFAULT_CACHE_CAPACITY: u64 = 1024;
 /// Considerations §B.5 `DoS` protection.
 pub const DEFAULT_HTTP_FETCH_LIMIT: u32 = 20;
 
-/// Default cache TTL (10 minutes) — short enough that a key rotation
-/// reaches verifiers quickly, long enough that a hot inbox does not
-/// re-fetch the same actor on every delivery.
-pub const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(10);
+/// Default ceiling on the number of in-flight deliveries the
+/// [`Outbox`](crate::Outbox) worker tolerates concurrently.
+///
+/// Prevents a `Create` addressed to tens of thousands of followers
+/// from pinning tens of thousands of TCP sockets and reqwest
+/// connection slots. Tune up on servers with abundant FDs and
+/// network bandwidth, tune down on constrained deployments.
+pub const DEFAULT_DELIVERY_CONCURRENCY: usize = 100;
 
 /// Default user agent header (`actpub-federation/<version>`).
 #[must_use]
@@ -68,12 +104,19 @@ pub struct FederationConfig {
     /// The actor's HTTP-Signature signing key, used by the deliverer
     /// to authenticate outbound POSTs and by the (optional) signed
     /// fetcher to authenticate outbound GETs.
-    pub signing_key: SigningKey,
+    ///
+    /// Deliberately `pub(crate)` so downstream code cannot read the
+    /// private key out of the configuration (e.g. to PEM-export it or
+    /// log it by accident). The runtime components that need it —
+    /// [`ReqwestFetcher`](crate::ReqwestFetcher) and
+    /// [`ReqwestDeliverer`](crate::ReqwestDeliverer) — access it
+    /// through [`Self::signing_key_ref`].
+    pub(crate) signing_key: SigningKey,
 
-    /// Stable URL identifying [`signing_key`](Self::signing_key) on
-    /// the wire. Goes into the `keyId` parameter of every emitted
-    /// `Signature:` / `Signature-Input:` header so verifiers can
-    /// fetch and check our public key.
+    /// Stable URL identifying [`Self::signing_key_ref`] on the wire.
+    /// Goes into the `keyId` parameter of every emitted `Signature:` /
+    /// `Signature-Input:` header so verifiers can fetch and check our
+    /// public key.
     pub key_id: Url,
 
     /// `User-Agent` header sent on every outbound request. Defaults
@@ -93,14 +136,38 @@ pub struct FederationConfig {
     #[builder(default = DEFAULT_MAX_RESPONSE_BYTES)]
     pub max_response_bytes: u64,
 
-    /// In-memory fetch-cache capacity (number of entries). Defaults
-    /// to [`DEFAULT_CACHE_CAPACITY`]. Set to `0` to disable caching.
+    /// In-memory actor-fetch cache capacity (number of entries).
+    /// Defaults to [`DEFAULT_CACHE_CAPACITY`]. Set to `0` to disable
+    /// caching. This is the cache the [`Fetcher`](crate::Fetcher)
+    /// uses to amortise successive dereferences of the same URL; it
+    /// is **not** the inbox-replay dedup cache (see
+    /// [`Self::dedup_capacity`]).
     #[builder(default = DEFAULT_CACHE_CAPACITY)]
     pub cache_capacity: u64,
 
-    /// In-memory fetch-cache TTL. Defaults to [`DEFAULT_CACHE_TTL`].
+    /// In-memory actor-fetch cache TTL. Defaults to
+    /// [`DEFAULT_CACHE_TTL`]. Bounds how long stale actor JSON is
+    /// allowed to survive key-rotation events.
     #[builder(default = DEFAULT_CACHE_TTL)]
     pub cache_ttl: Duration,
+
+    /// Inbox-replay dedup cache capacity (number of entries).
+    /// Defaults to [`DEFAULT_DEDUP_CAPACITY`]. One entry per
+    /// accepted inbox POST; sized for a Mastodon-class instance.
+    /// Eviction here is a **security** event — an activity evicted
+    /// before [`VerifyPolicy::max_age`](actpub_httpsig::VerifyPolicy)
+    /// passes becomes replayable — so tune up, not down, for
+    /// high-traffic deployments.
+    #[builder(default = DEFAULT_DEDUP_CAPACITY)]
+    pub dedup_capacity: u64,
+
+    /// Inbox-replay dedup cache TTL. Defaults to
+    /// [`DEFAULT_DEDUP_TTL`]. Should be at least as long as
+    /// [`Self::verify_policy`]'s `max_age`, otherwise a captured
+    /// POST can be replayed once the dedup entry expires even
+    /// though the freshness window is still open.
+    #[builder(default = DEFAULT_DEDUP_TTL)]
+    pub dedup_ttl: Duration,
 
     /// URL admission policy. Defaults to [`UrlPolicy::default`]
     /// (HTTPS only, no IP literals, no loopback).
@@ -120,6 +187,32 @@ pub struct FederationConfig {
     /// counter (primarily useful in tests).
     #[builder(default = DEFAULT_HTTP_FETCH_LIMIT)]
     pub http_fetch_limit: u32,
+
+    /// Upper bound on the number of concurrent deliveries the
+    /// [`Outbox`](crate::Outbox) worker is permitted to run. The
+    /// retry queue serialises delivery dispatches through a
+    /// [`tokio::sync::Semaphore`] sized by this value, so a fan-out
+    /// to thousands of inboxes cannot instantly saturate the
+    /// socket, FD and memory budget of the process. Defaults to
+    /// [`DEFAULT_DELIVERY_CONCURRENCY`].
+    #[builder(default = DEFAULT_DELIVERY_CONCURRENCY)]
+    pub delivery_concurrency: usize,
+
+    /// Freshness / replay-protection policy applied to every inbound
+    /// HTTP signature by [`InboxPipeline`](crate::InboxPipeline).
+    ///
+    /// Defaults to [`VerifyPolicy::mastodon`] — the 12 h past / 5 min
+    /// future skew window, with the Cavage and RFC 9421 minimum
+    /// covered-component sets enforced. Override with
+    /// [`VerifyPolicy::strict`] for internal deployments with
+    /// NTP-synchronised clocks, or build a custom `VerifyPolicy`
+    /// directly for unusual interop requirements.
+    ///
+    /// **Do not** use [`VerifyPolicy::no_freshness_check`] in
+    /// production: it disables every anti-replay gate this crate
+    /// ships with.
+    #[builder(default = VerifyPolicy::mastodon())]
+    pub verify_policy: VerifyPolicy,
 }
 
 impl FederationConfig {
@@ -128,6 +221,15 @@ impl FederationConfig {
     #[must_use]
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    /// Crate-internal accessor for [`Self::signing_key`]. Kept
+    /// private to the crate so application code cannot pull the
+    /// secret out of the config; the runtime's signing call-sites
+    /// (deliverer, signed fetcher) use this to reach the key.
+    #[must_use]
+    pub(crate) const fn signing_key_ref(&self) -> &SigningKey {
+        &self.signing_key
     }
 }
 
