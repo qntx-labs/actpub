@@ -12,6 +12,13 @@
 //!   cryptosuite (object-level signing for Mitra / Takahē / Mastodon
 //!   4.5+).
 //! - [`jcs`] — RFC 8785 JSON Canonicalisation Scheme helper.
+//! - [`Object`] / [`Actor`] / [`Activity`] — the three traits user
+//!   code implements to plug their own database row types into the
+//!   federation runtime.
+//! - [`ObjectId<T>`] — typed URL wrapper preserving the expected
+//!   resource type at compile time.
+//! - [`multikey_bridge`] — helpers to move between the wire-format
+//!   and crypto-layer FEP-521a Multikey representations.
 //!
 //! Higher-level federation runtime concerns (typed URL fetching,
 //! delivery queue, inbox pipeline) live in `actpub-federation`.
@@ -36,11 +43,16 @@
 pub mod eddsa_jcs;
 mod error;
 pub mod jcs;
+pub mod multikey_bridge;
+mod traits;
+mod typed_url;
 
 use serde as _;
 use tracing as _;
 
 pub use self::error::Error;
+pub use self::traits::{Activity, Actor, Object};
+pub use self::typed_url::{CollectionId, ObjectId};
 
 /// Crate [`Result`] alias with the default error type set to [`Error`].
 pub type Result<T, E = Error> = core::result::Result<T, E>;
