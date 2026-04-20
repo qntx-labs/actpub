@@ -83,4 +83,15 @@ pub enum Error {
     /// Invalid URL syntax.
     #[error("invalid URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
+
+    /// The signing actor exposed no public key (neither a FEP-521a
+    /// `assertionMethod` Multikey nor a legacy `publicKey.publicKeyPem`)
+    /// matching the signature's `keyId`.
+    #[error("actor has no usable public key: {0}")]
+    ActorWithoutKey(String),
+
+    /// The user-supplied [`ActivityHandler`](crate::ActivityHandler)
+    /// returned an error.
+    #[error("activity handler failed: {0}")]
+    HandlerFailed(String),
 }

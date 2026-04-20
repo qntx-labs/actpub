@@ -37,6 +37,7 @@ mod config;
 mod deliver;
 mod error;
 mod fetcher;
+mod inbox;
 mod policy;
 mod retry;
 
@@ -67,6 +68,7 @@ pub use self::fetcher::{
     AP_ACCEPT_HEADER, AP_CONTENT_TYPE, Fetcher, LD_CONTENT_TYPE_PREFIX, ReqwestFetcher,
     signed_fetch_signature_header,
 };
+pub use self::inbox::{ActivityHandler, InboxOutcome, InboxPipeline};
 pub use self::policy::UrlPolicy;
 pub use self::retry::RetryPolicy;
 
