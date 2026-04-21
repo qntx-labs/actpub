@@ -231,13 +231,19 @@ mod tests {
 
     #[test]
     fn delay_before_retry_one_equals_initial_delay() {
-        let p = RetryPolicy::mastodon();
+        // Force jitter to zero so this existing test still asserts
+        // on the deterministic curve shape; the jittered shape is
+        // covered separately by
+        // `delay_before_retry_respects_jitter_bounds_and_actually_jitters`.
+        let mut p = RetryPolicy::mastodon();
+        p.jitter_fraction = 0.0;
         assert_eq!(p.delay_before_retry(1), Duration::from_mins(5));
     }
 
     #[test]
     fn delay_before_retry_grows_exponentially_until_cap() {
-        let p = RetryPolicy::mastodon();
+        let mut p = RetryPolicy::mastodon();
+        p.jitter_fraction = 0.0;
         // 5min, 10min, 20min, 40min — pure exponential under the cap.
         assert_eq!(p.delay_before_retry(1), Duration::from_mins(5));
         assert_eq!(p.delay_before_retry(2), Duration::from_mins(10));
@@ -247,7 +253,8 @@ mod tests {
 
     #[test]
     fn delay_before_retry_caps_at_max_delay() {
-        let p = RetryPolicy::mastodon();
+        let mut p = RetryPolicy::mastodon();
+        p.jitter_fraction = 0.0;
         // After enough retries the curve hits the 60h cap and stays
         // there; attempt 50 must be exactly capped, not overflowed.
         assert_eq!(p.delay_before_retry(50), Duration::from_hours(60));
