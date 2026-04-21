@@ -301,7 +301,6 @@ where
         let handle = spawn_worker(
             Arc::downgrade(&inner),
             rx,
-            tx.clone(),
             stop,
             terminated,
             terminated_flag,
@@ -346,17 +345,30 @@ where
     /// prevents a producer from growing the queue without bound.
     pub async fn dispatch(&self, activity: Value, recipient_actors: &[Url]) -> DispatchReport {
         let resolution = self.resolve_inboxes(recipient_actors).await;
-        let enqueued = resolution.inboxes.len();
         // Clone the activity JSON **once** into an [`Arc`] and hand
         // every recipient a cheap Arc clone instead of N deep-copies.
         let activity = Arc::new(activity);
+        let mut enqueued: usize = 0;
+        let mut errors = resolution.errors;
         for inbox in resolution.inboxes {
-            self.enqueue_arc(Arc::clone(&activity), inbox).await;
+            match self.enqueue_arc(Arc::clone(&activity), inbox).await {
+                Ok(()) => enqueued += 1,
+                Err(Error::OutboxShutdown { inbox }) => {
+                    errors.push((inbox.clone(), Error::OutboxShutdown { inbox }));
+                }
+                // `enqueue_arc` only returns `Error::OutboxShutdown`
+                // today, but match exhaustively in case the error
+                // surface grows.
+                Err(other) => {
+                    tracing::error!(
+                        target: "actpub::outbox",
+                        error = %other,
+                        "unexpected enqueue error; attributing to first recipient",
+                    );
+                }
+            }
         }
-        DispatchReport {
-            enqueued,
-            errors: resolution.errors,
-        }
+        DispatchReport { enqueued, errors }
     }
 
     /// Enqueues a single delivery job, awaiting a channel slot if
@@ -367,33 +379,54 @@ where
     /// sharedInbox-aware mailer middleware). Wraps the activity in
     /// an [`Arc`] before handing it to the worker; prefer the
     /// [`Arc`]-typed [`Self::enqueue_arc`] if you already have one.
-    pub async fn enqueue(&self, activity: Value, inbox: Url) {
-        self.enqueue_arc(Arc::new(activity), inbox).await;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutboxShutdown`] if the worker has already
+    /// exited and the delivery channel has been closed. Callers may
+    /// persist the activity for later retry.
+    pub async fn enqueue(&self, activity: Value, inbox: Url) -> Result<(), Error> {
+        self.enqueue_arc(Arc::new(activity), inbox).await
     }
 
     /// [`Arc`]-aware variant of [`Self::enqueue`]. Prefer this when
     /// fanning the same activity out to N sibling inboxes — it
     /// avoids an N-way deep-copy of the JSON.
-    pub async fn enqueue_arc(&self, activity: Arc<Value>, inbox: Url) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutboxShutdown`] if the delivery channel
+    /// has been closed by a prior
+    /// [`Self::graceful_shutdown`] (or by a
+    /// [`Drop`]-based hard abort). The original `inbox` URL is
+    /// preserved inside the error so callers can persist the job
+    /// for manual retry.
+    pub async fn enqueue_arc(&self, activity: Arc<Value>, inbox: Url) -> Result<(), Error> {
         // `send` fails only once the worker is gone and the
         // channel has been closed — all graceful shutdown paths
         // let any remaining producer see a closed channel rather
         // than hanging forever.
-        if self
+        if let Err(send_err) = self
             .tx
             .send(DeliveryJob {
                 activity,
-                inbox,
+                inbox: inbox.clone(),
                 attempt: 0,
             })
             .await
-            .is_err()
         {
+            // Reconstruct the rejected inbox URL from the returned
+            // job so the diagnostic is accurate even if we ever
+            // grow the `DeliveryJob` shape.
+            let rejected = send_err.0.inbox;
             tracing::error!(
                 target: "actpub::outbox",
+                %rejected,
                 "outbox worker is gone; dropping delivery job",
             );
+            return Err(Error::OutboxShutdown { inbox: rejected });
         }
+        Ok(())
     }
 
     /// Signals the worker to stop accepting new jobs and awaits
@@ -403,13 +436,44 @@ where
     /// initiate shutdown; the first call wins and subsequent calls
     /// become no-ops. After this method returns, the worker is
     /// guaranteed to have exited (or been timed out) and the
-    /// channel is closed; any later [`Self::enqueue`] logs and
-    /// drops the job.
+    /// channel is closed; any later [`Self::enqueue`] returns
+    /// [`Error::OutboxShutdown`].
     ///
     /// Returns `Ok(())` on a clean exit, `Err` if the deadline
     /// elapsed while the worker was still running — callers MAY
     /// retry with a larger deadline or fall through to
     /// [`Drop`]-based abort.
+    ///
+    /// # Phase-3 delay semantics
+    ///
+    /// `timeout` bounds **only this caller's `await`**; the worker
+    /// task itself does NOT observe the value. Once the stop
+    /// signal fires, the worker enters a three-phase epilogue:
+    ///
+    /// 1. **Accept-cutoff:** stop accepting new jobs and
+    ///    `rx.close()` the delivery channel.
+    /// 2. **Drain:** spawn a [`run_one`] task for every job still
+    ///    buffered in the channel.
+    /// 3. **Join:** await every in-flight [`run_one`], **including
+    ///    its in-task retry loop**.
+    ///
+    /// Because retries are implemented as a [`run_one`]-local
+    /// `loop { sleep; deliver; }` rather than a re-queue onto the
+    /// channel, a delivery in the middle of a back-off contributes
+    /// its full `RetryPolicy::delay_before_retry(attempt)` to the
+    /// phase-3 wait. Under [`RetryPolicy::mastodon`] (8 retries,
+    /// exponential) this can exceed **10 minutes**.
+    ///
+    /// If `timeout` elapses before the worker's phase-3 join
+    /// completes, `graceful_shutdown` returns `Err(Elapsed)` but
+    /// the worker **keeps running**. Two follow-ups are possible:
+    ///
+    /// - call `graceful_shutdown` again with a larger deadline to
+    ///   block until the worker really finishes, or
+    /// - drop the last [`Outbox`] clone to invoke the
+    ///   [`Drop`]-based `JoinHandle::abort` path, which forcibly
+    ///   kills in-flight deliveries (any HTTP request currently
+    ///   on the wire is lost).
     ///
     /// # Errors
     ///
@@ -575,7 +639,6 @@ async fn wait_for_terminated(terminated: &Notify, terminated_flag: &AtomicBool) 
 fn spawn_worker<D, F>(
     inner: Weak<Inner<D, F>>,
     mut rx: mpsc::Receiver<DeliveryJob>,
-    tx_for_retry: mpsc::Sender<DeliveryJob>,
     stop: Arc<Notify>,
     terminated: Arc<Notify>,
     terminated_flag: Arc<AtomicBool>,
@@ -591,6 +654,13 @@ where
         // semantics: when `stop` is signalled we finish the
         // already-queued jobs AND wait for every spawned
         // `run_one` to complete before exiting.
+        //
+        // Retry is handled **inside** `run_one` as a tight
+        // in-task loop (not by re-queueing onto the channel),
+        // so a retry storm cannot interact with shutdown's
+        // `rx.close()` to silently drop pending attempts, and
+        // cannot livelock when `delivery_queue_capacity` is set
+        // below `delivery_concurrency`.
         let mut in_flight = JoinSet::<()>::new();
 
         // Phase 1 — accept new jobs.
@@ -619,9 +689,8 @@ where
                 maybe_job = rx.recv() => match maybe_job {
                     Some(job) => {
                         let Some(inner) = inner.upgrade() else { break };
-                        let tx_for_retry = tx_for_retry.clone();
                         in_flight.spawn(async move {
-                            run_one(inner, job, tx_for_retry).await;
+                            run_one(inner, job).await;
                         });
                     }
                     None => break, // all senders dropped
@@ -636,13 +705,19 @@ where
         // loop terminates as soon as the buffered queue is empty.
         while let Some(job) = rx.recv().await {
             let Some(inner) = inner.upgrade() else { break };
-            let tx_for_retry = tx_for_retry.clone();
             in_flight.spawn(async move {
-                run_one(inner, job, tx_for_retry).await;
+                run_one(inner, job).await;
             });
         }
 
-        // Phase 3 — wait for every in-flight delivery to finish.
+        // Phase 3 — wait for every in-flight delivery to finish,
+        // **including their retry loops**. This is the key
+        // distinction from the old channel-based retry design:
+        // a `run_one` that is currently backing off between
+        // attempts is still a live `JoinSet` entry, so the
+        // worker does not exit until every retry has either
+        // succeeded, exhausted the policy, or been aborted by
+        // a hard `abort()` from the outer `Drop` path.
         //
         // Failures inside `run_one` are already logged by that
         // function; we only consume the `JoinError`/`()` outputs
@@ -659,85 +734,85 @@ where
     })
 }
 
-async fn run_one<D, F>(
-    inner: Arc<Inner<D, F>>,
-    job: DeliveryJob,
-    tx_for_retry: mpsc::Sender<DeliveryJob>,
-) where
+async fn run_one<D, F>(inner: Arc<Inner<D, F>>, job: DeliveryJob)
+where
     D: Deliverer,
     F: Fetcher,
 {
-    // Back off BEFORE touching the permit: retry sleeps can span
-    // tens of minutes under `RetryPolicy::mastodon`, and holding a
-    // permit across them would drain `delivery_concurrency` to
-    // zero under even a modest stream of transient failures.
-    let delay = inner.retry_policy.delay_before_retry(job.attempt);
-    if delay > Duration::ZERO {
-        tokio::time::sleep(delay).await;
-    }
-    // Acquire one permit only for the actual deliver call. A
-    // `Semaphore::close` during shutdown surfaces here; we bail out
-    // instead of holding the job forever, and the retry path is
-    // lost because the process is going away anyway.
-    let Ok(permit) = Arc::clone(&inner.delivery_semaphore).acquire_owned().await else {
-        tracing::error!(
-            target: "actpub::outbox",
-            "delivery semaphore closed; dropping in-flight job",
-        );
-        return;
-    };
-    let _permit = permit;
     let DeliveryJob {
         activity,
         inbox,
-        attempt,
+        mut attempt,
     } = job;
-    match inner.deliverer.deliver(&activity, &inbox).await {
-        Ok(()) => {
-            tracing::debug!(target: "actpub::outbox", attempt, %inbox, "delivered");
+
+    // Retry loop is fully **in-task**: a failed delivery does
+    // not re-enter the delivery channel, so:
+    //
+    // 1. shutdown's `rx.close()` cannot silently discard a
+    //    pending retry — this task is tracked in the worker's
+    //    `JoinSet` and is therefore awaited by phase 3;
+    // 2. `delivery_queue_capacity < delivery_concurrency`
+    //    cannot livelock, because a run_one that is backing
+    //    off between attempts releases its permit first and
+    //    never parks on `channel.send`;
+    // 3. a retry storm is still bounded: every retry acquires
+    //    a permit from `delivery_semaphore`, so the steady-state
+    //    concurrency ceiling remains `delivery_concurrency`.
+    loop {
+        // Back off BEFORE touching the permit. Retry sleeps can
+        // span tens of minutes under `RetryPolicy::mastodon`,
+        // and holding a permit across them would drain
+        // `delivery_concurrency` to zero under even a modest
+        // stream of transient failures (P0-R2 invariant).
+        let delay = inner.retry_policy.delay_before_retry(attempt);
+        if delay > Duration::ZERO {
+            tokio::time::sleep(delay).await;
         }
-        Err(err) => {
-            let next = attempt + 1;
-            if inner.retry_policy.is_exhausted(next) {
-                tracing::warn!(
-                    target: "actpub::outbox",
-                    attempt = next,
-                    max = inner.retry_policy.max_retries,
-                    %inbox,
-                    %err,
-                    "delivery exhausted retries",
-                );
-            } else {
-                tracing::warn!(
-                    target: "actpub::outbox",
-                    attempt = next,
-                    max = inner.retry_policy.max_retries,
-                    %inbox,
-                    %err,
-                    "delivery failed; retrying",
-                );
-                // Retry via the bounded channel. `send().await` here
-                // applies the same backpressure a fresh enqueue
-                // would, so a retry storm cannot grow the queue
-                // past its cap. Failure means the channel has
-                // already been closed — shutdown is in progress
-                // and the retry is intentionally dropped.
-                if tx_for_retry
-                    .send(DeliveryJob {
-                        activity,
-                        inbox,
-                        attempt: next,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        target: "actpub::outbox",
-                        "outbox worker is gone; dropping retry job",
-                    );
-                }
+
+        // Acquire one permit only for the actual deliver call. A
+        // `Semaphore::close` during shutdown surfaces here; we
+        // bail out instead of holding the job forever.
+        let Ok(permit) = Arc::clone(&inner.delivery_semaphore).acquire_owned().await else {
+            tracing::error!(
+                target: "actpub::outbox",
+                "delivery semaphore closed; dropping in-flight job",
+            );
+            return;
+        };
+
+        let err = match inner.deliverer.deliver(&activity, &inbox).await {
+            Ok(()) => {
+                tracing::debug!(target: "actpub::outbox", attempt, %inbox, "delivered");
+                return;
             }
+            Err(err) => err,
+        };
+
+        let next = attempt + 1;
+        if inner.retry_policy.is_exhausted(next) {
+            tracing::warn!(
+                target: "actpub::outbox",
+                attempt = next,
+                max = inner.retry_policy.max_retries,
+                %inbox,
+                %err,
+                "delivery exhausted retries",
+            );
+            return;
         }
+        tracing::warn!(
+            target: "actpub::outbox",
+            attempt = next,
+            max = inner.retry_policy.max_retries,
+            %inbox,
+            %err,
+            "delivery failed; retrying",
+        );
+
+        // Release the permit BEFORE the next back-off so other
+        // jobs keep making progress while this task sleeps.
+        drop(permit);
+        attempt = next;
     }
 }
 
@@ -1569,13 +1644,18 @@ mod tests {
             .expect("idle worker must exit within the deadline");
 
         // After graceful_shutdown the channel is closed; further
-        // enqueue calls log-and-drop but do NOT panic or hang.
-        outbox
+        // enqueue calls must surface `Error::OutboxShutdown`
+        // (previously a silent tracing-only log).
+        let post_shutdown = outbox
             .enqueue(
                 json!({ "id": "after-shutdown", "type": "Create" }),
                 "https://example.com/inbox/a".parse().unwrap(),
             )
             .await;
+        assert!(
+            matches!(post_shutdown, Err(Error::OutboxShutdown { .. })),
+            "enqueue after graceful_shutdown must return OutboxShutdown, got {post_shutdown:?}",
+        );
     }
 
     #[tokio::test]
@@ -1632,7 +1712,8 @@ mod tests {
                     json!({ "id": format!("job-{i}"), "type": "Create" }),
                     format!("https://example.com/inbox/{i}").parse().unwrap(),
                 )
-                .await;
+                .await
+                .expect("pre-shutdown enqueue must succeed");
         }
         // Wait until all 5 deliveries have actually entered
         // `deliver()` so we KNOW they are in flight, not still
@@ -1703,7 +1784,8 @@ mod tests {
                 json!({ "id": "in-flight", "type": "Create" }),
                 "https://example.com/inbox/a".parse().unwrap(),
             )
-            .await;
+            .await
+            .expect("pre-shutdown enqueue must succeed");
         // Wait for the deliverer to park on the gate.
         wait_until_counter(&started, 1, Duration::from_secs(2)).await;
         assert_eq!(started.load(Ordering::SeqCst), 1);
@@ -1758,6 +1840,191 @@ mod tests {
             "second caller returned in {elapsed:?}, not after the worker \
              actually finished — suspicious",
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_completes_in_flight_retries() {
+        // P1-N22 regression: a delivery that fails on its first
+        // attempt USED to emit its retry by `tx_for_retry.send()`.
+        // But `graceful_shutdown` had already called `rx.close()`
+        // by the time phase-3 was awaiting `run_one`, so every
+        // retry `send` returned `Err` and was silently dropped —
+        // the worker exited "gracefully" while quietly losing
+        // half of the in-flight deliveries.
+        //
+        // The fix moved the retry loop **inside** `run_one`, so
+        // the retry is just another `deliver()` call on the same
+        // spawned task. Phase-3 `in_flight.join_next()` awaits
+        // the entire retry loop, so the regression guard is:
+        // enqueue a job whose first attempt fails, trigger
+        // shutdown with a deadline that comfortably fits the
+        // retry back-off, and assert the second attempt actually
+        // ran (deliver was called twice — recorded in
+        // `RecordingDeliverer::calls`).
+        let alice_url = "https://example.com/users/alice";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            alice_url.into(),
+            actor_with_inbox(alice_url, "https://example.com/users/alice/inbox"),
+        );
+        // Fail once, then succeed. `for_tests` back-off is 10ms.
+        let deliverer = Arc::new(RecordingDeliverer::new(1));
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::clone(&deliverer)),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            test_config(),
+        );
+
+        outbox
+            .dispatch(
+                json!({ "id": "https://example.com/a/retry", "type": "Create" }),
+                &[alice_url.parse().unwrap()],
+            )
+            .await;
+
+        // Wait for the first (failing) deliver call so we KNOW
+        // the job is in its retry sleep when we request shutdown.
+        wait_for_calls(&deliverer, 1, Duration::from_secs(2)).await;
+
+        // Shutdown deadline is large relative to the 10ms back-off.
+        // A correctly-draining worker finishes the retry well
+        // inside this window; a regressing worker (channel-based
+        // retry path) returns immediately with `calls.len() == 1`.
+        outbox
+            .graceful_shutdown(Duration::from_secs(5))
+            .await
+            .expect("graceful_shutdown must succeed within 5s");
+
+        let calls_len = deliverer.calls.lock().unwrap().len();
+        assert_eq!(
+            calls_len, 2,
+            "expected first attempt + retry to both run during drain, \
+             got {calls_len} calls — P1-N22 regressed",
+        );
+    }
+
+    #[tokio::test]
+    async fn small_queue_does_not_livelock_with_failing_deliveries() {
+        // P1-N23 regression: when `delivery_queue_capacity <
+        // delivery_concurrency` and every job fails once, the old
+        // channel-based retry path parked each run_one on
+        // `tx_for_retry.send().await` **while still holding its
+        // permit**. New incoming jobs then queued up behind the
+        // exhausted permit pool and the system degraded from
+        // parallel to sequential.
+        //
+        // With retries handled in-task, a backing-off run_one
+        // RELEASES its permit before sleeping, so concurrency
+        // is never lost. We configure the pathological shape
+        // (queue 2, concurrency 4, 4 jobs that each fail once)
+        // and assert the whole batch completes inside a budget
+        // that the old implementation could not meet.
+        let cfg = FederationConfig::builder()
+            .signing_key(SigningKey::generate_ed25519())
+            .key_id("https://sender.example/users/alice#key".parse().unwrap())
+            .url_policy(UrlPolicy::permissive_for_tests())
+            .delivery_concurrency(4)
+            .delivery_queue_capacity(2)
+            .build()
+            .shared();
+        // Fail once per (url, attempt) then succeed — four jobs
+        // each hit the retry path exactly once.
+        let deliverer = Arc::new(RecordingDeliverer::new(4));
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::clone(&deliverer)),
+            StaticFetcher {
+                actors: std::collections::HashMap::new(),
+            },
+            RetryPolicy::for_tests(),
+            cfg,
+        );
+
+        let started = std::time::Instant::now();
+        for i in 0..4 {
+            outbox
+                .enqueue(
+                    json!({ "id": format!("livelock-{i}"), "type": "Create" }),
+                    format!("https://example.com/inbox/{i}").parse().unwrap(),
+                )
+                .await
+                .expect("enqueue must succeed despite small queue");
+        }
+        // Each of 4 jobs needs 2 deliver calls. With concurrency
+        // 4 and a 10ms back-off we expect << 200ms steady-state;
+        // the old livelock shape (permit pool drained, 1-at-a-time
+        // throughput) would take >> 500ms. 2s is a generous
+        // upper bound for CI jitter.
+        wait_for_calls(&deliverer, 8, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        outbox
+            .graceful_shutdown(Duration::from_secs(5))
+            .await
+            .expect("clean shutdown expected");
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "small-queue batch took {elapsed:?} — livelock regressed",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_report_reflects_shutdown_rejections() {
+        // P2-N25 regression: when a `dispatch` race with
+        // `graceful_shutdown` causes every `enqueue_arc` to fail,
+        // the report USED to claim `enqueued == inboxes.len()`
+        // even though zero jobs were actually queued.
+        //
+        // The fix returns `Error::OutboxShutdown` from
+        // `enqueue_arc` and makes `dispatch` count only the real
+        // successes, pushing the rejected inboxes into
+        // `DispatchReport.errors`.
+        let alice_url = "https://example.com/users/alice";
+        let bob_url = "https://example.com/users/bob";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            alice_url.into(),
+            actor_with_inbox(alice_url, "https://example.com/users/alice/inbox"),
+        );
+        actors.insert(
+            bob_url.into(),
+            actor_with_inbox(bob_url, "https://example.com/users/bob/inbox"),
+        );
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::new(RecordingDeliverer::new(0))),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            test_config(),
+        );
+        // Shut down BEFORE dispatch runs: every enqueue_arc
+        // inside `dispatch` will see a closed channel.
+        outbox
+            .graceful_shutdown(Duration::from_secs(2))
+            .await
+            .expect("clean shutdown expected");
+
+        let report = outbox
+            .dispatch(
+                json!({ "id": "https://example.com/a/shutdown-race", "type": "Create" }),
+                &[alice_url.parse().unwrap(), bob_url.parse().unwrap()],
+            )
+            .await;
+        assert_eq!(
+            report.enqueued, 0,
+            "dispatch must NOT claim successes when the worker is gone",
+        );
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "each rejected recipient must produce one error entry",
+        );
+        for (_, err) in &report.errors {
+            assert!(
+                matches!(err, Error::OutboxShutdown { .. }),
+                "expected OutboxShutdown error, got {err:?}",
+            );
+        }
     }
 
     #[tokio::test]

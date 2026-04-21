@@ -169,4 +169,23 @@ pub enum Error {
         /// Human-readable explanation.
         reason: String,
     },
+
+    /// The [`Outbox`](crate::Outbox) worker has been shut down and
+    /// the delivery channel is closed, so a delivery job could not
+    /// be enqueued.
+    ///
+    /// Surfaced by [`Outbox::dispatch`](crate::Outbox::dispatch) when
+    /// `dispatch` races a concurrent
+    /// [`Outbox::graceful_shutdown`](crate::Outbox::graceful_shutdown)
+    /// — e.g. a SIGTERM handler that fires while a large fan-out is
+    /// mid-flight. Previously this condition was silently logged and
+    /// the [`DispatchReport`](crate::DispatchReport) falsely claimed
+    /// every recipient had been enqueued; callers now receive one
+    /// `OutboxShutdown` entry per undelivered recipient so they can
+    /// persist, retry, or report accurately.
+    #[error("outbox worker is shutting down; delivery to `{inbox}` was not enqueued")]
+    OutboxShutdown {
+        /// Inbox URL whose delivery job was rejected.
+        inbox: Url,
+    },
 }

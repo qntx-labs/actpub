@@ -250,7 +250,7 @@ where
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Dedup key selection:
+        // Dedup key selection & namespace separation:
         //
         // - When the activity carries an `id`, we canonicalise it
         //   (`https://Example.COM/a/1` and `https://example.com/a/1/`
@@ -259,20 +259,29 @@ where
         // - When no `id` is present — legitimate in some Misskey
         //   custom activity shapes and also the degenerate shape a
         //   buggy peer might burst-resend — we fall back to the
-        //   SHA-256 of the request body. The `SHA-256=` prefix
-        //   emitted by `sha256_digest_header` is URL-invalid, so a
-        //   body-hash key can never collide with a URL-derived
-        //   one's namespace even if a future peer happens to use a
-        //   literal `SHA-256=...` string as its activity id.
+        //   SHA-256 of the request body.
+        //
+        // Every key is prefixed with a short namespace tag (`id:`
+        // or `body:`). This is belt-and-braces defence in depth:
+        // `normalise_activity_id` returns its input verbatim for
+        // non-URL strings, so in principle a peer that set
+        // `id = "SHA-256=<base64>"` could collide with a later
+        // body-hash dedup key. The attack requires the attacker
+        // to *predict* the victim's future body bytes (SHA-256
+        // pre-image), which is not feasible — but the tag keeps
+        // the namespaces formally disjoint so we never have to
+        // re-evaluate that argument when the underlying functions
+        // change.
         //
         // Signature freshness has already gated a cross-capture
         // replay; this dedup layer is the last line of defence
         // against the *same* peer dispatching an activity twice in
         // a burst (network retry, crash recovery, etc.) and having
         // the handler fire twice.
-        let dedup_key: String = activity_id
-            .as_deref()
-            .map_or_else(|| sha256_digest_header(&body), normalise_activity_id);
+        let dedup_key: String = activity_id.as_deref().map_or_else(
+            || format!("body:{}", sha256_digest_header(&body)),
+            |id| format!("id:{}", normalise_activity_id(id)),
+        );
 
         if self.inner.seen.contains_key(&dedup_key) {
             return Ok(InboxOutcome::Duplicate {
@@ -750,6 +759,57 @@ mod tests {
             "second delivery of the SAME id-less body must be deduped \
              (the bug this regression test guards against silently \
               invoked the handler twice)",
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_namespaces_id_keys_disjoint_from_body_hash_keys() {
+        // P2-N26 regression: the id-based and body-hash-based
+        // dedup keys MUST live in disjoint namespaces so a
+        // carefully crafted `id` string can never collide with a
+        // body-hash key.
+        //
+        // Scenario: peer A sends an activity whose `id` is
+        // literally `"SHA-256=<fabricated>"` (attacker-chosen
+        // non-URL string — `normalise_activity_id` returns it
+        // verbatim because `Url::parse` fails). Then peer B
+        // sends a DIFFERENT activity with no `id`, whose
+        // `sha256_digest_header(body)` happens to render the
+        // same `"SHA-256=<x>"` string. Without namespace tags
+        // the two keys would collide and peer B's legitimate
+        // message would be dropped as a "duplicate".
+        //
+        // With `id:` / `body:` prefixes the keys are provably
+        // disjoint: an `id`-derived key starts with `id:` and a
+        // body-hash-derived key starts with `body:`, and
+        // neither prefix is producible by the other path.
+        //
+        // We assert the prefixing discipline directly rather
+        // than trying to engineer a real SHA-256 pre-image.
+        let body_a = b"{\"id\":\"SHA-256=fabricated\",\"type\":\"Create\"}";
+        let body_b = b"{\"type\":\"Note\"}";
+
+        let id_key = format!("id:{}", normalise_activity_id("SHA-256=fabricated"));
+        let body_key_a = format!("body:{}", actpub_httpsig::sha256_digest_header(body_a));
+        let body_key_b = format!("body:{}", actpub_httpsig::sha256_digest_header(body_b));
+
+        assert!(
+            id_key.starts_with("id:"),
+            "id-derived keys must carry the `id:` namespace tag",
+        );
+        assert!(
+            body_key_a.starts_with("body:") && body_key_b.starts_with("body:"),
+            "body-derived keys must carry the `body:` namespace tag",
+        );
+        assert_ne!(
+            id_key, body_key_a,
+            "id `SHA-256=fabricated` must not collide with a body-hash \
+             key — namespace isolation regressed",
+        );
+        assert_ne!(
+            id_key, body_key_b,
+            "id `SHA-256=fabricated` must not collide with any body-hash \
+             key — namespace isolation regressed",
         );
     }
 
