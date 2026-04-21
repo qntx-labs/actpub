@@ -130,7 +130,11 @@ impl Deliverer for ReqwestDeliverer {
         let legacy_digest = sha256_digest_header(&body);
         let modern_digest = content_digest_header_with(&body, &[DigestAlgorithm::Sha256]);
         let date = httpdate::fmt_http_date(std::time::SystemTime::now());
-        let host = inbox.host_str().unwrap_or("");
+        // Include a non-default port in the `Host` header so the
+        // signature base we hash here matches the one reqwest will
+        // produce on the wire. `Url::host_str` alone would drop the
+        // port and yield a signature the peer could not verify.
+        let host = crate::http_util::host_for_signing(inbox);
 
         // Build a typed http::Request, sign it via Cavage, then copy
         // the produced headers into the reqwest builder so the

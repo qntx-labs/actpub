@@ -380,12 +380,18 @@ impl Fetcher for ReqwestFetcher {
         let mut current = url.clone();
         let mut id_retries_remaining: u32 = 1;
         loop {
-            // Cache hits bypass both the counter and the DNS check: they
-            // represent fetches already budgeted for in a previous call,
-            // and the cached bytes cannot possibly reach a new IP.
+            // Cache hits bypass the network hop but NOT the per-request
+            // fetch budget: charging here (alongside `fetch_bytes` which
+            // charges on a miss) means the budget counts total fetches
+            // in this pipeline-logical request, not just network fetches.
+            // Without this a handler that happens to walk a highly-
+            // cached graph could recursively deref an unbounded
+            // number of already-hot URLs and bypass the
+            // [`RecursiveFetchLimit`] guard that defends §B.5.
             if let Some(cache) = &self.inner.cache
                 && let Some(hit) = cache.get(&current).await
             {
+                ctx.charge()?;
                 return Ok(serde_json::from_slice(&hit)?);
             }
 
@@ -509,7 +515,7 @@ fn build_signed_get_skeleton(url: &Url) -> Result<http::Request<Vec<u8>>, Error>
     http::Request::builder()
         .method(Method::GET)
         .uri(url.as_str())
-        .header("host", url.host_str().unwrap_or(""))
+        .header("host", crate::http_util::host_for_signing(url))
         .header(
             "date",
             httpdate::fmt_http_date(std::time::SystemTime::now()),
@@ -871,6 +877,54 @@ mod tests {
         assert!(header.contains("keyId="));
         assert!(header.contains("algorithm="));
         assert!(header.contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn cache_hits_consume_fetch_budget_too() {
+        // P1-N8 (sixth-round audit) regression: cache hits USED to
+        // bypass `FetchContext::charge`, so a handler that walked
+        // a graph whose nodes happened to be all already in the
+        // actor-fetch cache could recursively dereference an
+        // unbounded number of URLs and silently bypass the
+        // `RecursiveFetchLimit` guard that defends §B.5 (recursive
+        // fetch DoS).
+        //
+        // With the fix in place, a budget of N permits exactly N
+        // *logical* fetches regardless of whether each is
+        // satisfied by the cache or by the network.
+        let server = MockServer::start().await;
+        let url = format!("{}/users/alice", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/users/alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&json!({ "id": url, "type": "Person" })).unwrap(),
+                AP_CONTENT_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        let fetcher = ReqwestFetcher::new(test_config(&server.uri())).unwrap();
+
+        // Budget of 2: first call is a cache miss that charges 1
+        // and populates the cache; second call is a cache HIT that
+        // must still charge 1; a third call then exhausts the
+        // budget — which is the whole point of the fix.
+        let ctx = FetchContext::new(2);
+        fetcher
+            .fetch_raw(&url.parse().unwrap(), &ctx)
+            .await
+            .expect("first fetch should succeed (cache miss)");
+        fetcher
+            .fetch_raw(&url.parse().unwrap(), &ctx)
+            .await
+            .expect("second fetch should succeed (cache hit)");
+        let err = fetcher
+            .fetch_raw(&url.parse().unwrap(), &ctx)
+            .await
+            .expect_err("third fetch must exhaust the budget");
+        assert!(
+            matches!(err, Error::RecursiveFetchLimit { .. }),
+            "expected RecursiveFetchLimit, got {err:?}",
+        );
     }
 
     #[tokio::test]

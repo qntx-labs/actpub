@@ -57,6 +57,12 @@ impl Jrd {
     /// The canonical form is `rel="self"` with
     /// `type="application/activity+json"`. If no such link exists but one
     /// with the JSON-LD profile media type does, that is returned instead.
+    ///
+    /// Media-type matching is performed against the bare
+    /// `type/subtype` prefix so a parameter-carrying header like
+    /// `application/ld+json; profile="…"` still matches, while
+    /// unrelated subtypes that happen to share a string prefix
+    /// (e.g. `application/ld+jsonx`) do not.
     #[must_use]
     pub fn activitypub_actor(&self) -> Option<&JrdLink> {
         self.links
@@ -65,7 +71,7 @@ impl Jrd {
                 l.rel == rels::SELF
                     && matches!(
                         l.media_type.as_deref(),
-                        Some(mt) if mt == rels::MEDIA_TYPE_ACTIVITYPUB
+                        Some(mt) if bare_media_type(mt).eq_ignore_ascii_case(rels::MEDIA_TYPE_ACTIVITYPUB)
                     )
             })
             .or_else(|| {
@@ -73,7 +79,7 @@ impl Jrd {
                     l.rel == rels::SELF
                         && matches!(
                             l.media_type.as_deref(),
-                            Some(mt) if mt.starts_with("application/ld+json")
+                            Some(mt) if bare_media_type(mt).eq_ignore_ascii_case("application/ld+json")
                         )
                 })
             })
@@ -232,6 +238,19 @@ impl JrdLinkBuilder {
     pub fn build(self) -> JrdLink {
         self.inner
     }
+}
+
+/// Extracts the bare `type/subtype` prefix of a media-type string,
+/// stripping any RFC 6838 parameters.
+///
+/// `application/ld+json; profile="…"` → `"application/ld+json"`; a
+/// string without a `;` is returned as-is after trimming. Used by
+/// [`Jrd::activitypub_actor`] so a parameterised `type=` link still
+/// matches the canonical `WebFinger` media-type names without being
+/// fooled by unrelated subtypes that happen to share a string
+/// prefix (`application/ld+jsonx`).
+fn bare_media_type(mt: &str) -> &str {
+    mt.split(';').next().unwrap_or(mt).trim()
 }
 
 #[cfg(test)]
@@ -402,5 +421,54 @@ mod tests {
     fn find_link_returns_none_for_missing_rel() {
         let jrd = Jrd::builder("acct:alice@example.com").build();
         assert!(jrd.find_link("http://example.com/rel/missing").is_none());
+    }
+
+    #[test]
+    fn activitypub_actor_rejects_media_types_that_only_share_the_ld_json_prefix() {
+        // P1-N4 (sixth-round audit) regression: the earlier
+        // `starts_with("application/ld+json")` test matched bogus
+        // subtypes like `application/ld+jsonx` and
+        // `application/ld+jsonsomething`. The bare-media-type
+        // helper strips parameters before comparing the bare
+        // `type/subtype`, so only legitimate AS2.0 JSON-LD
+        // responses are recognised.
+        let jrd: Jrd = serde_json::from_value(json!({
+            "subject": "acct:alice@example.com",
+            "links": [{
+                "rel": "self",
+                // Attacker-supplied media type that a prefix match
+                // would have accepted as JSON-LD.
+                "type": "application/ld+jsonx",
+                "href": "https://example.com/attacker"
+            }]
+        }))
+        .expect("JRD must parse");
+        assert!(
+            jrd.activitypub_actor().is_none(),
+            "prefix-only media-type impersonation must NOT be accepted as the AP actor link",
+        );
+    }
+
+    #[test]
+    fn activitypub_actor_is_case_insensitive_on_media_type() {
+        // RFC 6838 makes media types case-insensitive; a peer
+        // emitting `APPLICATION/ACTIVITY+JSON` is still a valid
+        // AP actor link.
+        let jrd: Jrd = serde_json::from_value(json!({
+            "subject": "acct:alice@example.com",
+            "links": [{
+                "rel": "self",
+                "type": "Application/Activity+JSON",
+                "href": "https://example.com/users/alice"
+            }]
+        }))
+        .expect("JRD must parse");
+        let actor = jrd
+            .activitypub_actor()
+            .expect("case-insensitive media-type must be recognised");
+        assert_eq!(
+            actor.href.as_ref().map(Url::as_str),
+            Some("https://example.com/users/alice"),
+        );
     }
 }

@@ -246,6 +246,13 @@ where
         .map_err(Error::from)?;
 
         let activity: Value = serde_json::from_slice(&body)?;
+        // The HTTP signature proves the bytes were emitted by the
+        // signing actor; THIS check proves the payload's `actor`
+        // field names that same signer. Without it an attacker
+        // could sign-with-their-own-key an activity that claims
+        // `actor: victim`, and the handler would happily attribute
+        // the action to the victim.
+        enforce_activity_actor_binds_to_signer(&activity, &signing_actor)?;
         let activity_id = activity
             .get("id")
             .and_then(Value::as_str)
@@ -339,6 +346,65 @@ fn enforce_post(parts: &http::request::Parts) -> Result<(), Error> {
         url,
         reason: format!("inbox accepts POST only, got {}", parts.method),
     })
+}
+
+/// Enforces that `activity["actor"]` includes (or equals) the
+/// signing actor's `id`.
+///
+/// The HTTP-signature chain proves that the bytes of the activity
+/// were emitted by the holder of `signing_actor.id`'s private key,
+/// but it does NOT prove that the `actor` field inside the JSON
+/// body matches. Without this binding check an attacker A could
+/// sign — with A's own key — an activity payload whose `actor`
+/// points at victim B (e.g. `{"type": "Create", "actor": "https://victim/users/bob", …}`)
+/// and any downstream handler that trusts `activity.actor` would
+/// then attribute the Create to B.
+///
+/// Matching is **normalised** (host case-folded, fragment dropped,
+/// trailing-slash stripped) via [`normalise_activity_id`] so
+/// cosmetic URL variations do not create a false mismatch.
+///
+/// Accepts the three AS2.0 shapes for the `actor` field:
+///
+/// - plain string URL: `"actor": "https://..."`
+/// - nested object with `id`: `"actor": {"id": "https://...", …}`
+/// - array of either shape: `"actor": [...]`
+fn enforce_activity_actor_binds_to_signer(
+    activity: &Value,
+    signing_actor: &Value,
+) -> Result<(), Error> {
+    let signer_id = signing_actor
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::SignerKeyMismatch("signing actor has no `id` to bind against".to_owned())
+        })?;
+    let actor_field = activity.get("actor").ok_or_else(|| {
+        Error::SignerKeyMismatch("activity has no `actor` field; cannot bind to signer".to_owned())
+    })?;
+    let canonical_signer = normalise_activity_id(signer_id);
+    let matches = match actor_field {
+        Value::String(s) => normalise_activity_id(s) == canonical_signer,
+        Value::Array(arr) => arr.iter().any(|entry| match entry {
+            Value::String(s) => normalise_activity_id(s) == canonical_signer,
+            Value::Object(_) => entry
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| normalise_activity_id(s) == canonical_signer),
+            _ => false,
+        }),
+        Value::Object(_) => actor_field
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| normalise_activity_id(s) == canonical_signer),
+        _ => false,
+    };
+    if !matches {
+        return Err(Error::SignerKeyMismatch(format!(
+            "activity.actor does not reference signing actor `{signer_id}`",
+        )));
+    }
+    Ok(())
 }
 
 /// Enforces that the fetched `signing_actor.id` and the signing
@@ -891,6 +957,69 @@ mod tests {
         assert!(
             matches!(err, Error::PolicyViolation { ref reason, .. } if reason.contains("POST")),
             "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_activity_whose_actor_differs_from_signer() {
+        // P0-N2 (sixth-round audit) regression: the HTTP signature
+        // proves the bytes were emitted by the holder of the
+        // signing key, but it does NOT prove that the `actor`
+        // field inside the JSON body names that same signer.
+        // Without this binding check an attacker A (whose signing
+        // key lives on attacker.example) could sign an activity
+        // claiming `"actor": "https://victim.example/users/bob"`
+        // and any handler that trusts `activity.actor` would
+        // attribute the Create to B. The pipeline MUST reject the
+        // mismatch before the handler sees it.
+        //
+        // Note: to keep this test focused on the actor-binding
+        // gate, the attacker's keyId host, actor.id host, and
+        // fetched-actor id all align on attacker.example. The
+        // cross-domain keyId gate is already covered separately by
+        // `process_rejects_cross_domain_actor_impersonation`.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let activity = json!({
+            "id": "https://send.example.com/acts/impersonate",
+            "type": "Create",
+            // The lie: actor points at victim, not the actual signer
+            // whose fetched id is `send.example.com/users/alice`.
+            "actor": "https://victim.example/users/bob",
+        });
+        let (parts, body) = signed_inbox_request_with_key(&activity, &key);
+        // The fetched actor for the signing keyId (which
+        // `signed_inbox_request_with_key` pins to `send.example.com`)
+        // must live on the SAME host so the keyId-vs-actor-domain
+        // gate passes — otherwise this test would regress to the
+        // cross-domain gate and never exercise the `activity.actor`
+        // binding we actually want to guard.
+        let attacker_actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "assertionMethod": [{
+                "id": "https://send.example.com/users/alice#key",
+                "type": "Multikey",
+                "controller": "https://send.example.com/users/alice",
+                "publicKeyMultibase": multibase,
+            }],
+        });
+        let pipeline = InboxPipeline::new(
+            FakeFetcher(attacker_actor),
+            CountHandler::default(),
+            test_config(),
+        );
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("actor/signer mismatch must be rejected");
+        assert!(
+            matches!(err, Error::SignerKeyMismatch(ref r) if r.contains("activity.actor")),
+            "expected SignerKeyMismatch for activity.actor binding, got {err:?}",
         );
     }
 

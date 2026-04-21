@@ -183,12 +183,18 @@ where
     Err(last_err.unwrap_or(Error::VerificationFailed))
 }
 
+/// Parses the RFC 9421 `alg` signature parameter using the same
+/// canonical table as the rest of the crate.
+///
+/// Previously this had its own ad-hoc match that rejected `hs2019`
+/// as unsupported; that bypassed [`Algorithm::parse`], which
+/// correctly maps `hs2019` to `Ok(None)` (i.e. "derive algorithm
+/// from the key, no hint"). The old behaviour broke interop with
+/// any Fediverse peer still emitting Mastodon's legacy `hs2019`
+/// label and was a maintenance hazard: adding e.g. RSA-PSS to the
+/// canonical parser required touching two places.
 fn parse_alg_hint(hint: &str) -> Result<Option<Algorithm>, Error> {
-    match hint {
-        "rsa-v1_5-sha256" | "rsa-sha256" => Ok(Some(Algorithm::RsaSha256)),
-        "ed25519" => Ok(Some(Algorithm::Ed25519)),
-        other => Err(Error::UnsupportedAlgorithm(other.to_owned())),
-    }
+    Algorithm::parse(hint)
 }
 
 /// Rejects the signature when `signed` is missing any identifier in
@@ -270,6 +276,32 @@ mod tests {
         let err =
             rfc9421_verify(&req, |_| Ok(public.clone())).expect_err("tampered date must fail");
         assert!(matches!(err, Error::VerificationFailed));
+    }
+
+    #[test]
+    fn parse_alg_hint_accepts_legacy_hs2019_as_key_derived() {
+        // P0-N3 (sixth-round audit) regression: the old ad-hoc
+        // `parse_alg_hint` implementation hard-errored on every
+        // algorithm name outside {rsa-sha256, rsa-v1_5-sha256,
+        // ed25519}, including Mastodon's legacy `hs2019` label —
+        // which per RFC 9421 §3.1 means "derive algorithm from
+        // the key, no hint". The new implementation delegates to
+        // the canonical `Algorithm::parse` so `hs2019` returns
+        // `Ok(None)` and the verifier falls through to the
+        // key-derived algorithm as the RFC requires.
+        assert_eq!(
+            parse_alg_hint("hs2019").expect("hs2019 must be accepted"),
+            None
+        );
+        // And the canonical names still parse as specific algos.
+        assert_eq!(
+            parse_alg_hint("rsa-v1_5-sha256").expect("parse"),
+            Some(Algorithm::RsaSha256),
+        );
+        assert_eq!(
+            parse_alg_hint("ed25519").expect("parse"),
+            Some(Algorithm::Ed25519),
+        );
     }
 
     #[test]

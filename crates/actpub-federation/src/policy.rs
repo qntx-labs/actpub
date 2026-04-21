@@ -176,13 +176,30 @@ impl UrlPolicy {
         }
 
         let host_str = host.to_string();
-        if self.deny_hosts.iter().any(|h| h == &host_str) {
+        // Host comparison is ASCII-case-insensitive because DNS
+        // itself is case-insensitive: a deny-list entry of
+        // `"BAD.example"` MUST still block a request to
+        // `https://bad.example/` (and vice versa). The `url` crate
+        // already lower-cases the host of a parsed URL, but
+        // operator-supplied deny/allow lists are typed by humans
+        // and are not normalised, so the matcher normalises both
+        // sides at comparison time.
+        if self
+            .deny_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&host_str))
+        {
             return Err(violation(
                 url,
                 format!("host `{host_str}` is on the deny-list"),
             ));
         }
-        if !self.allow_hosts.is_empty() && !self.allow_hosts.iter().any(|h| h == &host_str) {
+        if !self.allow_hosts.is_empty()
+            && !self
+                .allow_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&host_str))
+        {
             return Err(violation(
                 url,
                 format!("host `{host_str}` is not on the allow-list"),

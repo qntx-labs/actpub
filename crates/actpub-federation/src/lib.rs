@@ -42,6 +42,7 @@ mod deliver;
 mod error;
 mod fetch_ctx;
 mod fetcher;
+mod http_util;
 mod inbox;
 mod outbox;
 mod policy;

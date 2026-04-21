@@ -2079,6 +2079,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_strips_bto_and_bcc_before_delivery() {
+        // P0-N1 (sixth-round audit) regression: W3C ActivityPub
+        // §6 Delivery is a MUST — "the server MUST remove the `bto`
+        // and/or `bcc` properties, if they exist, from the
+        // outgoing object". Prior to this regression guard,
+        // `Outbox::dispatch` handed the unmodified activity JSON
+        // straight to `serde_json::to_vec`, so any blind-recipient
+        // actor in `bto` / `bcc` would have their identity leaked
+        // to every (non-blind) recipient of the fan-out.
+        //
+        // We dispatch to a single actor, capture the activity the
+        // deliverer sees on the wire, and assert BOTH the top-level
+        // and the nested-object slots are gone.
+        let alice_url = "https://example.com/users/alice";
+        let mut actors = std::collections::HashMap::new();
+        actors.insert(
+            alice_url.into(),
+            actor_with_inbox(alice_url, "https://example.com/users/alice/inbox"),
+        );
+        let deliverer = Arc::new(RecordingDeliverer::new(0));
+        let outbox = Outbox::new(
+            ArcDeliverer(Arc::clone(&deliverer)),
+            StaticFetcher { actors },
+            RetryPolicy::for_tests(),
+            test_config(),
+        );
+
+        let activity_with_blind_recipients = json!({
+            "id": "https://example.com/activities/leak",
+            "type": "Create",
+            "actor": alice_url,
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "bto": ["https://example.com/users/secret-blind-top"],
+            "bcc": ["https://example.com/users/secret-blind-bottom"],
+            "object": {
+                "id": "https://example.com/notes/1",
+                "type": "Note",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "bto": ["https://example.com/users/secret-blind-obj-top"],
+                "bcc": ["https://example.com/users/secret-blind-obj-bottom"],
+                "content": "leak me not",
+            },
+        });
+
+        outbox
+            .dispatch(
+                activity_with_blind_recipients,
+                &[alice_url.parse().unwrap()],
+            )
+            .await;
+        wait_for_calls(&deliverer, 1, Duration::from_secs(2)).await;
+
+        // Snapshot the delivered activity and release the mutex
+        // before asserting — holding the lock across the assertion
+        // chain would trip `clippy::significant_drop_tightening`.
+        let delivered: Value = deliverer.calls.lock().unwrap()[0].1.clone();
+        assert!(
+            delivered.get("bto").is_none(),
+            "top-level `bto` MUST be stripped from the outgoing activity, \
+             got {delivered:?}",
+        );
+        assert!(
+            delivered.get("bcc").is_none(),
+            "top-level `bcc` MUST be stripped from the outgoing activity, \
+             got {delivered:?}",
+        );
+        let object = delivered.get("object").expect("object survives");
+        assert!(
+            object.get("bto").is_none(),
+            "nested-object `bto` MUST be stripped, got {object:?}",
+        );
+        assert!(
+            object.get("bcc").is_none(),
+            "nested-object `bcc` MUST be stripped, got {object:?}",
+        );
+        // Public `to` MUST be preserved (the whole point of the
+        // strip is to remove blind slots WITHOUT touching the
+        // public addressing).
+        assert!(
+            delivered.get("to").is_some(),
+            "public `to` must survive the strip",
+        );
+    }
+
+    #[tokio::test]
     async fn dropping_last_outbox_clone_aborts_worker() {
         // P1-N10 + P2-N19 regression: when every [`Outbox`] clone
         // drops, the `ShutdownHandle` Arc's strong count goes to
