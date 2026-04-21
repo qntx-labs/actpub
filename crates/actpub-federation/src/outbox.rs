@@ -345,6 +345,15 @@ where
     /// prevents a producer from growing the queue without bound.
     pub async fn dispatch(&self, activity: Value, recipient_actors: &[Url]) -> DispatchReport {
         let resolution = self.resolve_inboxes(recipient_actors).await;
+        // W3C ActivityPub §6 MUST: the server MUST remove `bto` and
+        // `bcc` before outgoing delivery so a blind-carbon-copied
+        // actor's identity is never leaked to the public or the
+        // non-blind recipients. Strip once here — before the
+        // [`Arc`] is built — so every downstream consumer
+        // (serialisation, HTTP signing, retry) sees the already
+        // cleansed payload.
+        let mut activity = activity;
+        strip_private_recipients(&mut activity);
         // Clone the activity JSON **once** into an [`Arc`] and hand
         // every recipient a cheap Arc clone instead of N deep-copies.
         let activity = Arc::new(activity);
@@ -381,12 +390,29 @@ where
     /// exited and the delivery channel has been closed. Callers may
     /// persist the activity for later retry.
     pub async fn enqueue(&self, activity: Value, inbox: Url) -> Result<(), Error> {
+        // W3C §6 MUST: strip `bto`/`bcc` before the payload leaves
+        // the server. Single-recipient `enqueue` is also an outgoing
+        // delivery path, so the invariant has to hold here too.
+        let mut activity = activity;
+        strip_private_recipients(&mut activity);
         self.enqueue_arc(Arc::new(activity), inbox).await
     }
 
     /// [`Arc`]-aware variant of [`Self::enqueue`]. Prefer this when
     /// fanning the same activity out to N sibling inboxes — it
     /// avoids an N-way deep-copy of the JSON.
+    ///
+    /// # Contract
+    ///
+    /// **Callers MUST strip `bto` / `bcc` from the activity before
+    /// wrapping it in the [`Arc`].** W3C `ActivityPub` §6 requires
+    /// those blind-recipient fields to be removed before any
+    /// outgoing delivery; this low-level entry point does not touch
+    /// the payload so that a dispatching caller can build one
+    /// [`Arc`] and fan it out to N inboxes without a `make_mut`
+    /// per recipient. Use [`Self::dispatch`] or [`Self::enqueue`]
+    /// if you have not already stripped the fields — they handle
+    /// the stripping for you.
     ///
     /// # Errors
     ///
@@ -808,6 +834,32 @@ where
         // jobs keep making progress while this task sleeps.
         drop(permit);
         attempt = next;
+    }
+}
+
+/// Removes `bto` and `bcc` from the top-level activity and, if the
+/// activity carries an inline `object`, from that nested object too.
+///
+/// W3C `ActivityPub` [§6 Delivery](https://www.w3.org/TR/activitypub/#delivery)
+/// is a **MUST**:
+///
+/// > The server MUST remove the `bto` and/or `bcc` properties, if
+/// > they exist, from the outgoing object.
+///
+/// The strip is confined to the two well-known top-level slots
+/// (activity and inline `object`); deeper nested objects are not
+/// traversed because a legitimate AS2.0 activity only carries
+/// blind-recipient lists at those two levels, and a deeper traversal
+/// risks mangling application-defined sub-objects that happen to use
+/// the field names for unrelated purposes.
+fn strip_private_recipients(activity: &mut Value) {
+    if let Value::Object(map) = activity {
+        map.remove("bto");
+        map.remove("bcc");
+        if let Some(Value::Object(inline_object)) = map.get_mut("object") {
+            inline_object.remove("bto");
+            inline_object.remove("bcc");
+        }
     }
 }
 
