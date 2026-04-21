@@ -59,6 +59,7 @@ unsigned-varint = { version = "0.8.0", default-features = false, features = ["st
 moka = { version = "0.12.15", default-features = false }
 itertools = "0.14.0"
 bon = "3.9.1"
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 
 pretty_assertions = "1.4.1"
 insta = { version = "1.47.2", default-features = false }

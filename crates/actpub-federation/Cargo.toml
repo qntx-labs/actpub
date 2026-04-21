@@ -29,6 +29,7 @@ futures = { workspace = true }
 httpdate = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 bon = { workspace = true }
+rand = { workspace = true }
 
 [features]
 # Exposes `UrlPolicy::permissive_for_tests` outside of cfg(test).

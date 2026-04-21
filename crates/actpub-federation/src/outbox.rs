@@ -351,21 +351,16 @@ where
         let mut enqueued: usize = 0;
         let mut errors = resolution.errors;
         for inbox in resolution.inboxes {
+            // Keep an inbox handle outside the match: any error
+            // returned by `enqueue_arc` is attributed to THIS
+            // recipient regardless of what fields the variant
+            // carries. The clone is the sole extra allocation a
+            // failed enqueue costs; the (far more common) success
+            // path takes `inbox` by value into `enqueue_arc`.
+            let inbox_for_error = inbox.clone();
             match self.enqueue_arc(Arc::clone(&activity), inbox).await {
                 Ok(()) => enqueued += 1,
-                Err(Error::OutboxShutdown { inbox }) => {
-                    errors.push((inbox.clone(), Error::OutboxShutdown { inbox }));
-                }
-                // `enqueue_arc` only returns `Error::OutboxShutdown`
-                // today, but match exhaustively in case the error
-                // surface grows.
-                Err(other) => {
-                    tracing::error!(
-                        target: "actpub::outbox",
-                        error = %other,
-                        "unexpected enqueue error; attributing to first recipient",
-                    );
-                }
+                Err(err) => errors.push((inbox_for_error, err)),
             }
         }
         DispatchReport { enqueued, errors }
@@ -1434,6 +1429,10 @@ mod tests {
             max_delay: Duration::from_millis(400),
             multiplier: 1.0,
             max_retries: 5,
+            // Deterministic delays keep the wall-clock-oriented
+            // assertions below reproducible; jitter is exercised
+            // by dedicated tests in `retry.rs`.
+            jitter_fraction: 0.0,
         };
         let cfg = FederationConfig::builder()
             .signing_key(SigningKey::generate_ed25519())
