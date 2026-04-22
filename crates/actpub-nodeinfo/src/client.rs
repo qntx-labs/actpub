@@ -129,10 +129,41 @@ pub async fn fetch_with_limit(
             requested: version.as_str(),
         })?;
 
+    // SSRF hardening (seventh-round audit P1-10): the advertised
+    // `href` comes from an untrusted remote document, so an
+    // attacker serving `/.well-known/nodeinfo` can redirect the
+    // client to an arbitrary URL — classically a cloud-metadata
+    // endpoint (`http://169.254.169.254/…`) or a loopback /
+    // private-range target — before the redirect-policy ever
+    // gets a chance to run, because it fires only on 3xx hops
+    // within a single `client.get(…)` call. We therefore refuse
+    // any href whose *origin* (scheme + host + port) differs
+    // from the discovery origin we were told to talk to.
+    if !same_origin(host, &link.href) {
+        return Err(Error::CrossOriginHref {
+            discovery: host.clone(),
+            href: link.href.clone(),
+        });
+    }
+
     debug!(url = %link.href, max_body_bytes, "fetching NodeInfo document");
 
     let body = request_capped(client, link.href.clone(), max_body_bytes).await?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+/// Returns `true` iff `a` and `b` share scheme, host and effective
+/// port. Matches the same-origin semantics Fetch / CORS use, and
+/// is the narrowest definition that still lets a server legally
+/// advertise `http://host/` during discovery and
+/// `http://host/nodeinfo/2.1` for the document.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme().eq_ignore_ascii_case(b.scheme())
+        && match (a.host_str(), b.host_str()) {
+            (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
+            _ => false,
+        }
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 async fn request_capped(client: &Client, url: Url, max_body_bytes: u64) -> Result<Vec<u8>, Error> {
@@ -208,6 +239,42 @@ mod tests {
 
         assert_eq!(info.version, Version::V2_1);
         assert_eq!(info.software.name, "mock-server");
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_cross_origin_href_advertised_by_discovery() {
+        // P1-10 (seventh-round audit) regression: an attacker
+        // controlling `/.well-known/nodeinfo` at the legitimate
+        // host could advertise a `href` pointing ANYWHERE — a
+        // cloud-metadata endpoint, a loopback admin interface, a
+        // private-network target — because the default `reqwest`
+        // redirect policy only kicks in on 3xx hops, not on the
+        // initial `client.get(href)` call. `fetch_with_limit`
+        // MUST refuse any href whose origin (scheme + host + port)
+        // does not match the discovery host.
+        let primary = MockServer::start().await;
+        let attacker = MockServer::start().await;
+        let attacker_nodeinfo = format!("{}/nodeinfo/2.1", attacker.uri());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/nodeinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "links": [{
+                    "rel": "http://nodeinfo.diaspora.software/ns/schema/2.1",
+                    "href": attacker_nodeinfo
+                }]
+            })))
+            .mount(&primary)
+            .await;
+
+        let client = Client::new();
+        let base: Url = primary.uri().parse().unwrap();
+        let err = fetch(&base, Version::V2_1, &client)
+            .await
+            .expect_err("cross-origin href must be refused");
+        assert!(
+            matches!(err, Error::CrossOriginHref { .. }),
+            "expected CrossOriginHref, got {err:?}",
+        );
     }
 
     #[tokio::test]

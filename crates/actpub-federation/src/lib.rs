@@ -16,6 +16,43 @@
 //! signature-verifying inbox pipeline) plug into this configuration
 //! and are introduced in subsequent steps.
 //!
+//! # Conformance scope
+//!
+//! This crate targets the **`ActivityPub` server-to-server (S2S)**
+//! surface, with the interop profile the mainstream Fediverse
+//! (Mastodon, Pleroma, Lemmy, Misskey, `GoToSocial`, Akkoma) has
+//! actually converged on. Concretely:
+//!
+//! - **In scope.** The `POST` delivery + inbox chain, HTTP
+//!   signatures (Cavage draft-12 + RFC 9421), `Digest` and RFC 9530
+//!   `Content-Digest`, `WebFinger`-based actor discovery, the
+//!   mandatory subset of the replay / freshness gates Fediverse
+//!   peers expect by default (12 h past / 5 min future skew), and
+//!   the key-ownership chains FEP-521a / FEP-8b32 demand.
+//! - **Out of scope.** The `ActivityPub` client-to-server (C2S)
+//!   API described in W3C §6 — including auto-wrapping bare
+//!   `Object`s in a `Create` on `POST` to the outbox, and the C2S
+//!   authorisation / collection semantics. C2S is a different
+//!   HTTP shape (OAuth, not signed requests) and serves a
+//!   different population (end-user clients, not peer servers);
+//!   conflating the two in one runtime was the mistake we
+//!   explicitly chose not to make. Consumers that need C2S build
+//!   it on top of this crate.
+//! - **Partial / advisory.** RFC 9421's full covered-component
+//!   vocabulary (`@status`, `@query-param`, structured-field
+//!   parameters) is intentionally NOT enforced — Fediverse peers
+//!   sign the minimum set (`@method @target-uri host date
+//!   content-digest`) and nothing else, so requiring more would
+//!   reject every real peer. `InboxPipeline` enforces exactly that
+//!   minimum via [`FederationConfig::verify_policy`]; a deployment
+//!   that needs the wider RFC 9421 surface can override the
+//!   policy, but it is not on by default because no peer produces
+//!   it. §7.1.2 Inbox Forwarding (`SHOULD` in the spec) is also
+//!   not implemented by this crate yet; embedding it requires an
+//!   application-specific definition of "local recipient" the
+//!   runtime cannot guess, so it is a candidate for a dedicated
+//!   trait in a future release.
+//!
 //! [`Fetcher`]: https://docs.rs/actpub-federation/latest/actpub_federation/trait.Fetcher.html
 //! [`Deliverer`]: https://docs.rs/actpub-federation/latest/actpub_federation/trait.Deliverer.html
 #![cfg_attr(docsrs, feature(doc_cfg))]

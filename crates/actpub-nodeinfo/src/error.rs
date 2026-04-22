@@ -41,4 +41,26 @@ pub enum Error {
     /// The response body could not be parsed as JSON.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// The discovery document advertised a `NodeInfo` document URL
+    /// whose origin (scheme + host + port) does not match the
+    /// `host` the discovery fetch was directed at.
+    ///
+    /// This defends against an SSRF pivot where an attacker serves
+    /// `/.well-known/nodeinfo` pointing at a cloud-metadata or
+    /// loopback URL; [`fetch_with_limit`](crate::fetch_with_limit)
+    /// refuses to follow the cross-origin hop before it reaches
+    /// the transport.
+    #[cfg(feature = "client")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+    #[error(
+        "NodeInfo discovery at `{discovery}` advertised a cross-origin href `{href}`; \
+         refusing to follow"
+    )]
+    CrossOriginHref {
+        /// The trusted host the discovery document was fetched from.
+        discovery: url::Url,
+        /// The attacker-controlled href the discovery tried to send us to.
+        href: url::Url,
+    },
 }

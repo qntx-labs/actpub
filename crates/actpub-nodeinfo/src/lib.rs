@@ -26,6 +26,10 @@
     clippy::error_impl_error,
     reason = "`Error` is the idiomatic name for the crate's top-level error enum, matching the `thiserror` convention used pervasively in the Rust ecosystem"
 )]
+#![allow(
+    clippy::result_large_err,
+    reason = "The `CrossOriginHref` variant carries two `Url`s (discovery + attacker-supplied) so operators can triage SSRF-pivot attempts from logs; boxing the whole enum would complicate every happy path for no measurable cost on the always-cold error path"
+)]
 #![cfg_attr(
     test,
     allow(

@@ -596,7 +596,7 @@ pub fn signed_fetch_signature_header(
 /// actor document. A prefix-match on `application/ld+json` is also
 /// rejected, which would otherwise admit bogus media types like
 /// `application/ld+jsonsomething` that happen to share the prefix.
-fn is_activitypub_media_type(content_type: &str) -> bool {
+pub(crate) fn is_activitypub_media_type(content_type: &str) -> bool {
     let primary = content_type
         .split(';')
         .next()

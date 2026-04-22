@@ -72,7 +72,7 @@ use url::Url;
 use crate::config::FederationConfig;
 use crate::error::Error;
 use crate::fetch_ctx::FetchContext;
-use crate::fetcher::Fetcher;
+use crate::fetcher::{Fetcher, is_activitypub_media_type};
 
 /// User-supplied callback invoked once per verified activity.
 ///
@@ -219,6 +219,7 @@ where
         body: Bytes,
     ) -> Result<InboxOutcome, Error> {
         enforce_post(parts)?;
+        enforce_content_type(parts)?;
         verify_body_integrity(parts, &body)?;
         let key_id = extract_key_id(parts)?;
         let actor_url = strip_fragment(&key_id)?;
@@ -326,6 +327,49 @@ fn normalise_activity_id(id: &str) -> String {
     url.into()
 }
 
+/// Rejects inbox POSTs whose `Content-Type` is not an
+/// `ActivityPub`-compatible media type before any cryptographic
+/// work is performed.
+///
+/// W3C `ActivityPub` §3.2 requires receiving servers to SHOULD
+/// accept `application/activity+json` and
+/// `application/ld+json; profile="https://www.w3.org/ns/activitystreams"`.
+/// Mainstream Fediverse implementations (Mastodon, Pleroma, Lemmy,
+/// Misskey) **reject** any other `Content-Type` on the inbox,
+/// so matching that behaviour is both a spec-aligned hardening
+/// and an interoperability win: a misrouted HTML form POST,
+/// OAuth error response, or `application/json` payload from a
+/// mis-configured bot cannot slip past the first gate and waste
+/// a signature-verification CPU cycle.
+///
+/// Missing `Content-Type` is treated as a violation — every real
+/// AP peer sets it, and silently accepting an empty type would
+/// invite content-type-confusion downstream.
+fn enforce_content_type(parts: &http::request::Parts) -> Result<(), Error> {
+    let raw = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if is_activitypub_media_type(raw) {
+        return Ok(());
+    }
+    let url = parts.uri.to_string().parse().unwrap_or_else(|_| {
+        #[allow(
+            clippy::unwrap_used,
+            reason = "the literal `https://unknown/` is well-formed by construction"
+        )]
+        Url::parse("https://unknown/").unwrap()
+    });
+    Err(Error::PolicyViolation {
+        url,
+        reason: format!(
+            "inbox requires ActivityPub Content-Type \
+             (application/activity+json or application/ld+json), got `{raw}`",
+        ),
+    })
+}
+
 /// Rejects any request whose method is not POST before any
 /// cryptographic work is performed.
 fn enforce_post(parts: &http::request::Parts) -> Result<(), Error> {
@@ -383,25 +427,40 @@ fn enforce_activity_actor_binds_to_signer(
         Error::SignerKeyMismatch("activity has no `actor` field; cannot bind to signer".to_owned())
     })?;
     let canonical_signer = normalise_activity_id(signer_id);
-    let matches = match actor_field {
-        Value::String(s) => normalise_activity_id(s) == canonical_signer,
-        Value::Array(arr) => arr.iter().any(|entry| match entry {
+    let entry_matches = |entry: &Value| -> bool {
+        match entry {
             Value::String(s) => normalise_activity_id(s) == canonical_signer,
             Value::Object(_) => entry
                 .get("id")
                 .and_then(Value::as_str)
                 .is_some_and(|s| normalise_activity_id(s) == canonical_signer),
             _ => false,
-        }),
-        Value::Object(_) => actor_field
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|s| normalise_activity_id(s) == canonical_signer),
+        }
+    };
+    let matches = match actor_field {
+        Value::String(_) | Value::Object(_) => entry_matches(actor_field),
+        // AS2.0 §4.1 permits `actor` to be an array (collaborative
+        // authorship), but a single HTTP-signature only attests for
+        // ONE signer, so the strict-and-safe rule is: accept an
+        // array ONLY when it contains exactly one entry and that
+        // entry names the signer. Any other shape (multi-entry
+        // array, empty array, mixed types) is rejected — otherwise
+        // an attacker Alice could smuggle
+        // `"actor": ["https://attacker/alice","https://victim/bob"]`
+        // through the pipeline and have downstream handlers that
+        // read `actor[0]` attribute the activity to victim Bob,
+        // even though Alice's key is the ONLY one that signed
+        // the request. This is the `any()`-was-too-permissive
+        // regression fixed in the seventh-round audit (P0-5).
+        Value::Array(arr) => arr
+            .as_slice()
+            .first()
+            .is_some_and(|only| arr.len() == 1 && entry_matches(only)),
         _ => false,
     };
     if !matches {
         return Err(Error::SignerKeyMismatch(format!(
-            "activity.actor does not reference signing actor `{signer_id}`",
+            "activity.actor does not uniquely reference signing actor `{signer_id}`",
         )));
     }
     Ok(())
@@ -961,6 +1020,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_rejects_non_activitypub_content_type_before_verification() {
+        // P1-9 (seventh-round audit) regression: the pipeline MUST
+        // reject inbox POSTs whose `Content-Type` is not one of the
+        // two W3C §3.2 media types (`application/activity+json`,
+        // `application/ld+json; profile=...`). Bare
+        // `application/json` is intentionally rejected because it
+        // is the classic content-type-confusion vector — an
+        // attacker controlling a misrouted OAuth error endpoint
+        // could otherwise get the handler to parse a non-AP
+        // payload as an activity.
+        //
+        // Rejection happens BEFORE signature verification so a
+        // misrouted POST does not burn a CPU cycle on crypto it
+        // was never going to pass.
+        let (mut parts, body, _) = signed_inbox_request(&json!({
+            "id": "https://send.example.com/acts/x",
+            "type": "Create",
+            "actor": "https://send.example.com/users/alice",
+        }));
+        parts.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let actor = json!({ "id": "https://send.example.com/users/alice", "type": "Person" });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("application/json must be rejected by the content-type gate");
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation { ref reason, .. }
+                    if reason.contains("ActivityPub Content-Type")
+            ),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_missing_content_type_before_verification() {
+        // A peer that forgot to set `Content-Type` entirely is
+        // treated exactly the same as one that set the wrong
+        // value: silently accepting an empty media type would
+        // invite the same content-type-confusion downstream that
+        // the gate is designed to prevent.
+        let (mut parts, body, _) = signed_inbox_request(&json!({
+            "id": "https://send.example.com/acts/y",
+            "type": "Create",
+            "actor": "https://send.example.com/users/alice",
+        }));
+        parts.headers.remove(http::header::CONTENT_TYPE);
+        let actor = json!({ "id": "https://send.example.com/users/alice", "type": "Person" });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("missing Content-Type must be rejected");
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation { ref reason, .. }
+                    if reason.contains("ActivityPub Content-Type")
+            ),
+            "unexpected: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_accepts_ld_json_with_activitystreams_profile() {
+        // The alternative spec-legal media type
+        // `application/ld+json; profile="..."` (used by Lemmy, some
+        // Misskey builds, and anything emitted through a strict
+        // JSON-LD processor) MUST still be accepted.
+        //
+        // `content-type` is in the default Cavage signed header
+        // set, so this request has to be signed with the exact
+        // `application/ld+json; profile=…` value baked into the
+        // signature base; swapping the header post-signing would
+        // simply trip the integrity check instead of the content
+        // gate we are trying to exercise.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let activity = json!({
+            "id": "https://send.example.com/acts/ldjson",
+            "type": "Create",
+            "actor": "https://send.example.com/users/alice",
+        });
+        let body = serde_json::to_vec(&activity).unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://recv.example.com/users/bob/inbox")
+            .header("host", "recv.example.com")
+            .header(
+                "date",
+                httpdate::fmt_http_date(std::time::SystemTime::now()),
+            )
+            .header(
+                "content-type",
+                "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+            )
+            .header("digest", sha256_digest_header(&body))
+            .header(
+                "content-digest",
+                content_digest_header_with(&body, &[actpub_httpsig::DigestAlgorithm::Sha256]),
+            )
+            .body(body.clone())
+            .unwrap();
+        CavageSigner::new(&key, "https://send.example.com/users/alice#key")
+            .sign(&mut req)
+            .unwrap();
+        let (parts, _) = req.into_parts();
+
+        let actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "assertionMethod": [{
+                "id": "https://send.example.com/users/alice#key",
+                "type": "Multikey",
+                "controller": "https://send.example.com/users/alice",
+                "publicKeyMultibase": multibase,
+            }],
+        });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let outcome = pipeline
+            .process(&parts, Bytes::from(body))
+            .await
+            .expect("application/ld+json with AS profile must be accepted");
+        assert!(matches!(outcome, InboxOutcome::Accepted { .. }));
+    }
+
+    #[tokio::test]
     async fn process_rejects_activity_whose_actor_differs_from_signer() {
         // P0-N2 (sixth-round audit) regression: the HTTP signature
         // proves the bytes were emitted by the holder of the
@@ -1021,6 +1219,99 @@ mod tests {
             matches!(err, Error::SignerKeyMismatch(ref r) if r.contains("activity.actor")),
             "expected SignerKeyMismatch for activity.actor binding, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_activity_that_smuggles_victim_into_actor_array() {
+        // P0-5 (seventh-round audit) regression: previously we
+        // accepted the activity whenever *any* entry of
+        // `activity.actor` matched the signer, which let an
+        // attacker smuggle the victim into a collaborative
+        // actor list:
+        //
+        //   activity.actor = [attacker, victim]
+        //   HTTP signature = attacker's key
+        //
+        // A downstream handler reading `actor[0]` would then
+        // attribute the Create to whoever happened to sit first
+        // in the array — the attacker controls that ordering.
+        //
+        // The hardened rule rejects every `actor` array that is
+        // not exactly one entry long, even if the signer is in
+        // the array, so there is no place left to hide a second
+        // identity.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let activity = json!({
+            "id": "https://send.example.com/acts/smuggle",
+            "type": "Create",
+            "actor": [
+                "https://send.example.com/users/alice",   // real signer
+                "https://victim.example/users/bob",       // smuggled
+            ],
+        });
+        let (parts, body) = signed_inbox_request_with_key(&activity, &key);
+        let actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "assertionMethod": [{
+                "id": "https://send.example.com/users/alice#key",
+                "type": "Multikey",
+                "controller": "https://send.example.com/users/alice",
+                "publicKeyMultibase": multibase,
+            }],
+        });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let err = pipeline
+            .process(&parts, body)
+            .await
+            .expect_err("multi-entry actor array must be rejected even when signer is in it");
+        assert!(
+            matches!(err, Error::SignerKeyMismatch(ref r) if r.contains("uniquely")),
+            "expected SignerKeyMismatch with `uniquely` wording, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_accepts_single_entry_actor_array_that_names_signer() {
+        // The hardened rule must NOT be so strict that it rejects
+        // the common `actor: [alice]` shape — some peers emit a
+        // one-element array even for a single signer, and that is
+        // semantically equivalent to `actor: "alice"`.
+        let key = SigningKey::generate_ed25519();
+        let public = key.verifying_key();
+        let multibase = match &public {
+            VerifyingKey::Ed25519(k) => HsMultikey::encode_ed25519(k),
+            other => unreachable!("test signs with Ed25519, got {other:?}"),
+        };
+        let activity = json!({
+            "id": "https://send.example.com/acts/single-array",
+            "type": "Create",
+            "actor": ["https://send.example.com/users/alice"],
+        });
+        let (parts, body) = signed_inbox_request_with_key(&activity, &key);
+        let actor = json!({
+            "id": "https://send.example.com/users/alice",
+            "type": "Person",
+            "assertionMethod": [{
+                "id": "https://send.example.com/users/alice#key",
+                "type": "Multikey",
+                "controller": "https://send.example.com/users/alice",
+                "publicKeyMultibase": multibase,
+            }],
+        });
+        let pipeline =
+            InboxPipeline::new(FakeFetcher(actor), CountHandler::default(), test_config());
+        let outcome = pipeline
+            .process(&parts, body)
+            .await
+            .expect("single-entry actor array equal to signer must be accepted");
+        assert!(matches!(outcome, InboxOutcome::Accepted { .. }));
     }
 
     #[tokio::test]
