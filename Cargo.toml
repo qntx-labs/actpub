@@ -42,7 +42,7 @@ reqwest-middleware = "0.5.1"
 
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
 tower = { version = "0.5.3", default-features = false }
-tower-http = { version = "0.6.8", default-features = false }
+tower-http = { version = "0.6.10", default-features = false }
 
 tokio = { version = "1.52.1", default-features = false }
 tokio-util = { version = "0.7.18", default-features = false }
