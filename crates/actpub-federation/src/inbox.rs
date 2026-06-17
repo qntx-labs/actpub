@@ -708,6 +708,7 @@ mod tests {
 
     impl Fetcher for FakeFetcher {
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]
@@ -725,6 +726,7 @@ mod tests {
     impl ActivityHandler for CountHandler {
         type Error = std::convert::Infallible;
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]

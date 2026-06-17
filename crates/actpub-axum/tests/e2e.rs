@@ -45,6 +45,7 @@ struct StaticFetcher(Value);
 
 impl Fetcher for StaticFetcher {
     #[allow(
+        unknown_lints,
         clippy::unused_async_trait_impl,
         reason = "trait definition requires async but mock implementation has no await"
     )]
@@ -82,6 +83,7 @@ struct AliceResolver(Jrd);
 
 impl WebFingerResolver for AliceResolver {
     #[allow(
+        unknown_lints,
         clippy::unused_async_trait_impl,
         reason = "trait definition requires async but mock implementation has no await"
     )]

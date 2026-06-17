@@ -114,6 +114,7 @@ mod tests {
 
     impl WebFingerResolver for StaticResolver {
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]

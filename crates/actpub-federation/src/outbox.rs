@@ -968,6 +968,7 @@ mod tests {
 
     impl Deliverer for RecordingDeliverer {
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]
@@ -994,6 +995,7 @@ mod tests {
 
     impl Fetcher for StaticFetcher {
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]
@@ -1431,6 +1433,7 @@ mod tests {
 
     impl Deliverer for SplitDeliverer {
         #[allow(
+            unknown_lints,
             clippy::unused_async_trait_impl,
             reason = "trait definition requires async but mock implementation has no await"
         )]
