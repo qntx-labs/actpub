@@ -201,7 +201,10 @@ mod tests {
     struct FakeFetcher(Value);
 
     impl Fetcher for FakeFetcher {
-        #[allow(clippy::unused_async_trait_impl)]
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn fetch_raw(
             &self,
             _url: &url::Url,
@@ -216,7 +219,10 @@ mod tests {
 
     impl ActivityHandler for CountHandler {
         type Error = std::convert::Infallible;
-        #[allow(clippy::unused_async_trait_impl)]
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn handle(
             &self,
             _activity: Value,

@@ -967,6 +967,10 @@ mod tests {
     }
 
     impl Deliverer for RecordingDeliverer {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn deliver(&self, activity: &Value, inbox: &Url) -> Result<(), Error> {
             self.calls
                 .lock()
@@ -989,6 +993,10 @@ mod tests {
     }
 
     impl Fetcher for StaticFetcher {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn fetch_raw(&self, url: &Url, _ctx: &FetchContext) -> Result<Value, Error> {
             self.actors
                 .get(url.as_str())
@@ -1422,6 +1430,10 @@ mod tests {
     }
 
     impl Deliverer for SplitDeliverer {
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn deliver(&self, _activity: &Value, inbox: &Url) -> Result<(), Error> {
             if inbox.as_str().contains("fail") {
                 return Err(Error::Status {

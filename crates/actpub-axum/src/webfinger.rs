@@ -113,7 +113,10 @@ mod tests {
     struct StaticResolver(Option<Jrd>);
 
     impl WebFingerResolver for StaticResolver {
-        #[allow(clippy::unused_async_trait_impl)]
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait definition requires async but mock implementation has no await"
+        )]
         async fn resolve(&self, _resource: String) -> Result<Option<Jrd>, String> {
             Ok(self.0.clone())
         }
