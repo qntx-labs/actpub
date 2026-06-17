@@ -44,6 +44,7 @@ use url::Url;
 struct StaticFetcher(Value);
 
 impl Fetcher for StaticFetcher {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn fetch_raw(
         &self,
         _url: &Url,
@@ -77,6 +78,7 @@ impl ActivityHandler for CaptureHandler {
 struct AliceResolver(Jrd);
 
 impl WebFingerResolver for AliceResolver {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn resolve(&self, resource: String) -> Result<Option<Jrd>, String> {
         if resource == "acct:alice@example.com" {
             Ok(Some(self.0.clone()))

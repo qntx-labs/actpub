@@ -201,6 +201,7 @@ mod tests {
     struct FakeFetcher(Value);
 
     impl Fetcher for FakeFetcher {
+        #[allow(clippy::unused_async_trait_impl)]
         async fn fetch_raw(
             &self,
             _url: &url::Url,
@@ -215,6 +216,7 @@ mod tests {
 
     impl ActivityHandler for CountHandler {
         type Error = std::convert::Infallible;
+        #[allow(clippy::unused_async_trait_impl)]
         async fn handle(
             &self,
             _activity: Value,

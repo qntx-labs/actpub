@@ -4,9 +4,9 @@
 //! keys, and `PUBLIC KEY` (`SubjectPublicKeyInfo`) for the public half. The
 //! Fediverse actor `publicKey.publicKeyPem` field follows the SPKI form.
 
-use pkcs8::der::asn1::AnyRef;
+use pkcs8::der::asn1::{AnyRef, OctetStringRef};
 use pkcs8::{
-    AlgorithmIdentifierRef, ObjectIdentifier, PrivateKeyInfo, SubjectPublicKeyInfoRef,
+    AlgorithmIdentifierRef, ObjectIdentifier, PrivateKeyInfoRef, SubjectPublicKeyInfoRef,
     der::{Decode, Encode},
 };
 
@@ -188,7 +188,7 @@ fn encode_pem(label: &'static str, der: &[u8]) -> String {
 /// so that we never misclassify a key whose parameters happen to contain
 /// a byte sequence overlapping an unrelated OID.
 fn parse_pkcs8_algorithm_oid(der: &[u8]) -> Result<ObjectIdentifier, Error> {
-    let info = PrivateKeyInfo::from_der(der).map_err(|e| Error::InvalidPkcs8(e.to_string()))?;
+    let info = PrivateKeyInfoRef::from_der(der).map_err(|e| Error::InvalidPkcs8(e.to_string()))?;
     Ok(info.algorithm.oid)
 }
 
@@ -209,12 +209,14 @@ fn parse_spki(der: &[u8]) -> Result<(ObjectIdentifier, &[u8]), Error> {
 /// expected by `aws-lc-rs`, attaching the `rsaEncryption` algorithm
 /// identifier with the mandatory NULL parameters.
 fn wrap_pkcs1_rsa_as_pkcs8(pkcs1_der: &[u8]) -> Result<Vec<u8>, Error> {
-    let info = PrivateKeyInfo::new(
+    let private_key =
+        OctetStringRef::new(pkcs1_der).map_err(|e| Error::InvalidPkcs8(e.to_string()))?;
+    let info = PrivateKeyInfoRef::new(
         AlgorithmIdentifierRef {
             oid: OID_RSA_ENCRYPTION,
             parameters: Some(AnyRef::NULL),
         },
-        pkcs1_der,
+        private_key,
     );
     info.to_der().map_err(|e| Error::InvalidPem(e.to_string()))
 }
@@ -326,8 +328,8 @@ mod tests {
             block.contents().to_vec()
         };
         let pkcs1_body = {
-            let info = PrivateKeyInfo::from_der(&pkcs8_der).expect("pkcs8 decode");
-            info.private_key.to_vec()
+            let info = PrivateKeyInfoRef::from_der(&pkcs8_der).expect("pkcs8 decode");
+            info.private_key.as_bytes().to_vec()
         };
         let pkcs1_pem = encode_pem(PEM_LABEL_RSA_PRIVATE_KEY, &pkcs1_body);
         let reloaded = rsa_signing_key_from_pem(&pkcs1_pem).expect("accept PKCS#1");
